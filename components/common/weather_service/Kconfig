@@ -1,0 +1,21 @@
+menu "Weather Service"
+
+config WEATHER_SERVICE_REFRESH_MINUTES
+    int "Automatic refresh interval (minutes)"
+    range 5 360
+    default 30
+    help
+        Normal product refresh interval. A successful Wi-Fi connection triggers
+        an immediate refresh; this interval controls subsequent refreshes.
+
+config WEATHER_SERVICE_TASK_STACK_SIZE
+    int "Weather service task stack size"
+    range 4096 12288
+    default 8192
+
+config WEATHER_SERVICE_TASK_PRIORITY
+    int "Weather service task priority"
+    range 1 10
+    default 4
+
+endmenu

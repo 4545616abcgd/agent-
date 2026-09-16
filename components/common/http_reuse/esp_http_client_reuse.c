@@ -270,12 +270,60 @@ static size_t pool_count_locked(void)
     return n;
 }
 
+/*
+ * A pooled esp_http_client handle may live much longer than the stack frame of
+ * the request that created/leased it.  Never leave request-scoped event
+ * handlers or user_data attached while the handle is idle: the real IDF
+ * cleanup path emits events, including when the idle reaper destroys a pooled
+ * handle later from the FreeRTOS timer task.
+ */
+static esp_err_t idle_event_handler(esp_http_client_event_t *evt)
+{
+    (void)evt;
+    return ESP_OK;
+}
+
+static esp_err_t client_prepare_for_idle(esp_http_client_handle_t client)
+{
+    esp_err_t err;
+
+    if (!client) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * Replace the callback first.  If an unexpected teardown event occurs
+     * before user_data is cleared, the no-op callback still cannot touch the
+     * previous request context.
+     */
+    err = esp_http_client_set_event_handler(client, idle_event_handler);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "detach event handler failed for %p: %s", client, esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_http_client_set_user_data(client, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "clear user_data failed for %p: %s", client, esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 static void node_free(http_reuse_node_t *node, bool destroy_client)
 {
     if (!node) {
         return;
     }
     if (destroy_client && node->client) {
+        /*
+         * Belt-and-suspenders protection for every pool-owned destruction
+         * path.  Idle entries should already be neutralized before insertion,
+         * but doing it again prevents a stale request callback from being
+         * reached if a future caller changes the pool lifecycle.
+         */
+        (void)client_prepare_for_idle(node->client);
         __real_esp_http_client_cleanup(node->client);
     }
     endpoint_release(&node->endpoint);
@@ -667,10 +715,25 @@ esp_err_t __wrap_esp_http_client_cleanup(esp_http_client_handle_t client)
             node_free(node, true);
             return ESP_OK;
         }
-        node->is_persistent           = true;
-        node->leased                  = false; /* idle in pool for pool_take */
-        node->reused_in_current_lease = false; /* lease ended */
-        node->last_update_ticks       = xTaskGetTickCount();
+
+        /*
+         * The node is still leased, so the idle reaper cannot touch it while
+         * request-scoped state is detached.  Only expose it as idle after both
+         * the callback and user_data have been neutralized successfully.
+         */
+        esp_err_t detach_err = client_prepare_for_idle(client);
+        if (detach_err != ESP_OK) {
+            STAILQ_REMOVE(&s_pool, node, http_reuse_node, list);
+            pool_mutex_give();
+            ESP_LOGW(TAG, "cannot safely park pooled client %p; destroying", client);
+            node_free(node, true);
+            return ESP_OK;
+        }
+
+        node->is_persistent            = true;
+        node->leased                   = false; /* idle in pool for pool_take */
+        node->reused_in_current_lease  = false; /* lease ended */
+        node->last_update_ticks        = xTaskGetTickCount();
         pool_mutex_give();
         ESP_LOGD(TAG, "idle persistent in pool %p", client);
         return ESP_OK;
@@ -695,6 +758,18 @@ esp_err_t __wrap_esp_http_client_cleanup(esp_http_client_handle_t client)
     esp_err_t             epe = endpoint_from_client(client, &ep);
     if (epe != ESP_OK) {
         ESP_LOGE(TAG, "persistent %p get_url/endpoint failed (%s), destroy", client, esp_err_to_name(epe));
+        return __real_esp_http_client_cleanup(client);
+    }
+
+    /*
+     * A fresh handle is not visible to the pool yet.  Detach all lease-local
+     * state before inserting it, otherwise a later idle eviction can call the
+     * old event handler with a pointer to a dead stack frame.
+     */
+    esp_err_t detach_err = client_prepare_for_idle(client);
+    if (detach_err != ESP_OK) {
+        ESP_LOGW(TAG, "cannot safely retain persistent client %p; destroying", client);
+        endpoint_release(&ep);
         return __real_esp_http_client_cleanup(client);
     }
 

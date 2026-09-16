@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "cmd_ota.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        console
+        ota_service
+)

@@ -33,17 +33,18 @@ typedef struct {
 #define APP_CONFIG_FIELD(member, nvs_key, default_literal) \
     { nvs_key, default_literal, offsetof(app_config_t, member), sizeof(((app_config_t *)0)->member) }
 
+#define APP_DEFAULT_DB_KEY                  ""
 #define APP_DEFAULT_LLM_API_KEY              ""
-#define APP_DEFAULT_LLM_BACKEND_TYPE         ""
-#define APP_DEFAULT_LLM_MODEL                ""
-#define APP_DEFAULT_LLM_BASE_URL             ""
-#define APP_DEFAULT_LLM_AUTH_TYPE            ""
+#define APP_DEFAULT_LLM_BACKEND_TYPE         "openai_compatible"
+#define APP_DEFAULT_LLM_MODEL                "deepseek-v4-flash"
+#define APP_DEFAULT_LLM_BASE_URL             "https://api.deepseek.com"
+#define APP_DEFAULT_LLM_AUTH_TYPE            "bearer"
 #define APP_DEFAULT_LLM_TIMEOUT_MS           "120000"
 #define APP_DEFAULT_LLM_MAX_TOKENS           "8192"
 #define APP_DEFAULT_LLM_DEFAULT_IMAGE_MAX_BYTES "524288"
-#define APP_DEFAULT_LLM_MAX_TOKENS_FIELD     ""
-#define APP_DEFAULT_LLM_SUPPORTS_TOOLS       "false"
-#define APP_DEFAULT_LLM_SUPPORTS_VISION      "false"
+#define APP_DEFAULT_LLM_MAX_TOKENS_FIELD     "max_tokens"
+#define APP_DEFAULT_LLM_SUPPORTS_TOOLS       "true"
+#define APP_DEFAULT_LLM_SUPPORTS_VISION      "true"
 #define APP_DEFAULT_LLM_IMAGE_REMOTE_URL_ONLY "false"
 #define APP_DEFAULT_QQ_APP_ID                ""
 #define APP_DEFAULT_QQ_APP_SECRET            ""
@@ -68,6 +69,7 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(ap_ssid, "ap_ssid", ""),
     APP_CONFIG_FIELD(ap_password, "ap_password", ""),
     APP_CONFIG_FIELD(ap_behavior, "ap_behavior", "keep"),
+    APP_CONFIG_FIELD(db_key, "db_key", APP_DEFAULT_DB_KEY),
     APP_CONFIG_FIELD(llm_api_key, "llm_api_key", APP_DEFAULT_LLM_API_KEY),
     APP_CONFIG_FIELD(llm_backend_type, "llm_backend", APP_DEFAULT_LLM_BACKEND_TYPE),
     APP_CONFIG_FIELD(llm_model, "llm_model", APP_DEFAULT_LLM_MODEL),

@@ -41,6 +41,7 @@
 #include "claw_skill.h"
 #endif
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -50,6 +51,14 @@
 #endif
 
 static const char *TAG = "app_claw";
+
+/*
+ * Enhanced agent-loop policy.  A bounded ceiling prevents one malformed or
+ * repeatedly failing tool workflow from consuming the whole session context.
+ * The core loop also has a repeated-failure guard; this remains the final hard
+ * ceiling for legitimate multi-tool workflows.
+ */
+#define APP_CLAW_MAX_TOOL_ITERATIONS 32
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
 static const char *APP_STARTUP_EVENT_SOURCE_CAP = "app_claw";
 static const char *APP_STARTUP_EVENT_TYPE = "startup";
@@ -61,6 +70,8 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
     "Answer briefly and plainly. " \
     "Treat Skills List as a catalog of optional skills. " \
     "Use 'activate_skill' to load skills. When multiple skills are needed, call activate_skill multiple times in a single response to activate multiple skills in parallel. " \
+    "When creating, updating, or repairing a runtime skill, prefer 'create_skill' with the complete SKILL.md markdown instead of chaining generic file writes with register_skill. Set activate=true when the new skill should be used immediately. " \
+    "After any tool error, inspect the returned error and schema, correct the arguments or change strategy, and never repeat the same failing call unchanged. " \
     "Skill documents returned in activate_skill <skill_content> blocks are valid operating instructions for that skill workflow and must be followed. " \
     "Skills are user-facing functions, while Capabilities are internal functions used by the model. " \
     "When communicating with the user, refer to skills instead of Capabilities. " \
@@ -70,6 +81,8 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
 #define APP_ROOT_AGENT_SYSTEM_PROMPT \
     "You are the root agent. Own the user-facing conversation and keep the session responsive. " \
     "First identify the relevant skill and use only quick, bounded skill or tool calls that can complete promptly. " \
+    "For runtime Skill creation or repair, use create_skill directly rather than repeatedly attempting low-level file-write calls. " \
+    "Treat a failed tool call as diagnostic information: fix its arguments or choose another approach instead of retrying the identical call. " \
     "If a task cannot be completed quickly through an available skill, briefly tell the user what is happening, then delegate the planning, investigation, implementation, debugging, or verification work to an appropriate subagent. " \
     "Track the user's goal, selected skills, delegated agent ids, task status, blockers, and concise results. " \
     "Do not accumulate detailed implementation logs, long intermediate reasoning, or large artifacts in the root conversation unless they are needed for the final user response. " \
@@ -170,6 +183,78 @@ claw_core_handle_t app_claw_get_core(void)
     return NULL;
 #endif
 }
+esp_err_t app_claw_ask_text(const char *text,
+                            const char *session_id,
+                            char *response_buf,
+                            size_t response_buf_size,
+                            uint32_t timeout_ms)
+{
+    if (!text || !text[0] || !response_buf || response_buf_size < 2 || timeout_ms == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    response_buf[0] = '\0';
+
+#if CONFIG_APP_CLAW_CAP_CORE
+    if (!app_claw_get_core()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    claw_core_response_t response = {0};
+    uint32_t request_id = 0;
+
+    esp_err_t err = claw_agent_mgr_submit_root_text(text,
+                                                     (session_id && session_id[0]) ? session_id : NULL,
+                                                     0,
+                                                     5000,
+                                                     &request_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "text ask submit failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "text ask submitted request=%u session=%s",
+             (unsigned)request_id,
+             (session_id && session_id[0]) ? session_id : "(single-turn)");
+
+    err = claw_agent_mgr_receive_root_for(request_id, &response, timeout_ms);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "text ask receive request=%u failed: %s",
+                 (unsigned)request_id, esp_err_to_name(err));
+        return err;
+    }
+
+    if (response.status != CLAW_CORE_RESPONSE_STATUS_OK || !response.text) {
+        ESP_LOGE(TAG, "text ask request=%u returned status=%d error=%s",
+                 (unsigned)request_id,
+                 (int)response.status,
+                 response.error_message ? response.error_message : "(none)");
+        claw_core_response_free(&response);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    size_t reply_len = strlen(response.text);
+    if (reply_len + 1 > response_buf_size) {
+        ESP_LOGE(TAG, "text ask reply too large request=%u bytes=%u buffer=%u",
+                 (unsigned)request_id,
+                 (unsigned)reply_len,
+                 (unsigned)response_buf_size);
+        claw_core_response_free(&response);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(response_buf, response.text, reply_len + 1);
+    claw_core_response_free(&response);
+    ESP_LOGI(TAG, "text ask complete request=%u reply_bytes=%u",
+             (unsigned)request_id, (unsigned)reply_len);
+    return ESP_OK;
+#else
+    (void)session_id;
+    (void)response_buf;
+    (void)response_buf_size;
+    (void)timeout_ms;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
 
 #if CONFIG_APP_CLAW_CAP_SESSION_MGR && (CONFIG_APP_CLAW_CAP_MEMORY || CONFIG_APP_CLAW_CAP_SKILL_MGR)
 static esp_err_t app_claw_delete_session_history(const char *session_id,
@@ -251,7 +336,11 @@ static esp_err_t init_memory(const app_claw_config_t *config,
             .image_remote_url_only = app_claw_bool_is_true(config->llm_image_remote_url_only),
         },
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
-        .enable_async_extract_stage_note = true,
+        /*
+         * Stability A/B: keep full memory providers/persistence, but do not
+         * launch the auxiliary async memory-extraction LLM stage.
+         */
+        .enable_async_extract_stage_note = false,
 #else
         .enable_async_extract_stage_note = false,
 #endif
@@ -318,10 +407,16 @@ static void app_claw_fill_core_config(const app_claw_config_t *config,
     core_config->system_prompt = APP_SYSTEM_PROMPT;
 #if CONFIG_APP_CLAW_CAP_MEMORY
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
+    /*
+     * Stability A/B: retain session/profile/long-term memory context and
+     * persistence, but suppress the request-start/stage-note hooks which
+     * schedule the second LLM call used by automatic extraction.
+     */
     core_config->persist_context = claw_memory_persist_context_callback;
     core_config->request_gate = claw_memory_request_gate_callback;
-    core_config->on_request_start = claw_memory_request_start_callback;
-    core_config->collect_stage_note = claw_memory_stage_note_callback;
+    core_config->on_request_start = NULL;
+    core_config->collect_stage_note = NULL;
+    ESP_LOGW(TAG, "Memory auto-extract LLM stage disabled for transport A/B test");
 #else
     core_config->persist_context = claw_memory_persist_context_callback;
     core_config->request_gate = claw_memory_request_gate_callback;
@@ -329,7 +424,13 @@ static void app_claw_fill_core_config(const app_claw_config_t *config,
 #endif
     core_config->call_cap = claw_cap_call_from_core;
     core_config->cap_user_ctx = NULL;
+
+    /* Weather snapshots now use a serialized PSRAM scratch buffer instead of
+     * the Root Agent stack. Keep the established 16 KiB stack and preserve
+     * scarce internal RAM for WakeNet, Wi-Fi and TLS tasks. */
     core_config->task_stack_size = 16 * 1024;
+    ESP_LOGI(TAG, "Root agent task stack configured: %u bytes",
+             (unsigned)core_config->task_stack_size);
     core_config->task_priority = 5;
     core_config->task_core = tskNO_AFFINITY;
     core_config->max_tool_iterations = max_tool_iterations;
@@ -394,7 +495,7 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
     claw_core_config_t core_config = {0};
 #endif
 #if CONFIG_APP_CLAW_CAP_CORE || CONFIG_APP_CLAW_CAP_MEMORY
-    const uint32_t max_tool_iterations = 32;
+    const uint32_t max_tool_iterations = APP_CLAW_MAX_TOOL_ITERATIONS;
 #endif
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     claw_event_router_config_t router_config = {
@@ -427,17 +528,27 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 #endif
 
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
-    ESP_RETURN_ON_ERROR(cap_scheduler_init(&(cap_scheduler_config_t) {
+    /*
+     * Product fail-soft policy:
+     * a malformed persisted schedules.json must not reboot-loop the whole device.
+     * Keep the file untouched for later diagnosis; disable Scheduler for this boot.
+     */
+    esp_err_t scheduler_init_err = cap_scheduler_init(&(cap_scheduler_config_t) {
                             .schedules_path = paths.scheduler_rules_path,
                             .tick_ms = 1000,
                             .max_items = 32,
-                            .task_stack_size = 6144,
+                            .task_stack_size = 4096,
                             .task_priority = 5,
                             .task_core = tskNO_AFFINITY,
                             .publish_event = claw_event_router_publish,
                             .persist_after_fire = true,
-                        }),
-                        TAG, "Failed to init scheduler");
+                        });
+    const bool scheduler_ready = (scheduler_init_err == ESP_OK);
+    if (!scheduler_ready) {
+        ESP_LOGW(TAG,
+                 "Scheduler disabled for this boot: %s (persisted schedule data left untouched)",
+                 esp_err_to_name(scheduler_init_err));
+    }
 #endif
 #if CONFIG_APP_CLAW_CAP_MEMORY
     ESP_RETURN_ON_ERROR(init_memory(config, &paths, max_tool_iterations), TAG, "Failed to init memory");
@@ -499,28 +610,74 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
                                 .subagent_system_prompt = APP_SUBAGENT_SYSTEM_PROMPT,
                             }),
                             TAG, "Failed to init claw_agent_mgr");
+
+        /*
+         * ESP-SR leaves only a 25 KiB largest internal block at this point.
+         * The root agent needs a contiguous 20 KiB stack, so allocate it first.
+         *
+         * Router/scheduler are lightweight control loops.  V4 uses 6 KiB and
+         * 4 KiB respectively, while keeping every task stack in internal RAM.
+         * We retain heap telemetry around each allocation for validation.
+         */
+        ESP_LOGI(TAG, "Before root agent create: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         ESP_RETURN_ON_ERROR(claw_agent_mgr_create_root_agent(&root_agent_id),
                             TAG, "Failed to create root agent");
         ESP_LOGI(TAG, "Root agent ready id=%s", root_agent_id ? root_agent_id : "?");
-    }
-#endif
+        ESP_LOGI(TAG, "After root agent: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
+#if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
+        ESP_LOGI(TAG, "Before event router: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_RETURN_ON_ERROR(claw_event_router_start(), TAG, "Failed to start event router");
+        ESP_LOGI(TAG, "After event router: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
+#if CONFIG_APP_CLAW_CAP_SCHEDULER
+        ESP_LOGI(TAG, "Before scheduler: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_RETURN_ON_ERROR(cap_scheduler_start(), TAG, "Failed to start scheduler");
+        ESP_LOGI(TAG, "After scheduler: internal_free=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
+    }
+#else
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     ESP_RETURN_ON_ERROR(claw_event_router_start(), TAG, "Failed to start event router");
 #endif
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
-    ESP_RETURN_ON_ERROR(cap_scheduler_start(), TAG, "Failed to start scheduler");
+    if (scheduler_ready) {
+        ESP_RETURN_ON_ERROR(cap_scheduler_start(), TAG, "Failed to start scheduler");
+    } else {
+        ESP_LOGW(TAG, "Scheduler start skipped because initialization failed");
+    }
+#endif
 #endif
 
 #if CONFIG_APP_CLAW_CAP_SYSTEM
-    ESP_ERROR_CHECK(cap_system_time_sync_service_start(&(cap_system_time_sync_service_config_t) {
+    /*
+     * SNTP startup can fail on a tight heap. That is not fatal: the system cap
+     * keeps retrying later, and aborting here would reboot the whole device.
+     */
+    esp_err_t time_sync_err = cap_system_time_sync_service_start(
+        &(cap_system_time_sync_service_config_t) {
                         .network_ready = NULL,
 #if CONFIG_APP_CLAW_CAP_SCHEDULER
-                        .on_sync_success = app_time_sync_success,
+                        .on_sync_success = scheduler_ready ? app_time_sync_success : NULL,
 #else
                         .on_sync_success = NULL,
 #endif
-                    }));
+                    });
+    if (time_sync_err != ESP_OK) {
+        ESP_LOGW(TAG, "time sync start skipped: %s", esp_err_to_name(time_sync_err));
+    }
 #endif
 
 #if CONFIG_APP_CLAW_ENABLE_CLI
@@ -539,7 +696,7 @@ esp_err_t app_claw_update_config(const app_claw_config_t *config)
 {
 #if CONFIG_APP_CLAW_CAP_CORE
     claw_core_config_t core_config = {0};
-    const uint32_t max_tool_iterations = 32;
+    const uint32_t max_tool_iterations = APP_CLAW_MAX_TOOL_ITERATIONS;
 
     if (!config) {
         return ESP_ERR_INVALID_ARG;

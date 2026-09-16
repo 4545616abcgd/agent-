@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "app_claw.h"
+#include "app_capabilities.h"
 #include "app_fs.h"
 #include "claw_version.h"
 #include "claw_paths.h"
@@ -23,6 +24,15 @@
 #include "esp_board_manager_includes.h"
 #include "captive_dns.h"
 #include "cmd_wifi.h"
+#include "cmd_voice.h"
+#include "voice_service.h"
+#include "voice_dialog.h"
+#include "cmd_weather.h"
+#include "cmd_ota.h"
+#include "ota_service.h"
+#include "weather_service.h"
+#include "weather_provider_qweather.h"
+#include "cap_weather_station.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #if CONFIG_APP_CLAW_CAP_IM_WECHAT
@@ -31,11 +41,15 @@
 #include "app_config.h"
 
 #define APP_ENABLE_MEM_LOG        (0)
+/* Product build: keep ESP-Claw, Weather, WebIM and voice online together. */
+#define APP_VOICE_TRANSPORT_AB_MODE (0)
 
 static const char *TAG = "app";
 
 static app_config_t *s_config;
 static app_claw_config_t *s_claw_config;
+static bool s_weather_ready;
+static bool s_claw_runtime_started;
 
 static esp_err_t app_allocate_runtime_state(void)
 {
@@ -89,9 +103,16 @@ static void on_wifi_state_changed(bool connected, void *user_ctx)
              status.mode ? status.mode : "off",
              ap_ssid ? ap_ssid : "(none)");
 
-    esp_err_t err = app_claw_set_network_status(connected, ap_ssid);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to update network emote: %s", esp_err_to_name(err));
+    if (s_weather_ready) {
+        weather_service_set_network_online(connected);
+    }
+    ota_service_set_network_online(connected);
+
+    if (s_claw_runtime_started) {
+        esp_err_t err = app_claw_set_network_status(connected, ap_ssid);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to update network emote: %s", esp_err_to_name(err));
+        }
     }
 }
 
@@ -313,12 +334,63 @@ static void memory_monitor_task(void *arg)
 
 #endif
 
+static void init_weather_stack(void)
+{
+    esp_err_t err = weather_service_init(NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Weather service init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = weather_provider_qweather_register();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "QWeather provider registration failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = weather_service_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Weather service start failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    s_weather_ready = true;
+    ESP_LOGI(TAG, "Weather service started (provider=qweather)");
+}
+
+
+static esp_err_t main_register_weather_cap_group(const app_claw_config_t *config,
+                                                 const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_weather_station_register_group();
+}
+
+static esp_err_t register_weather_agent_capability(void)
+{
+    static const app_capability_external_group_t group = {
+        .group_id = "cap_weather_station",
+        .display_name = "Weather Station",
+        .llm_visible_by_default = true,
+        .prepare = NULL,
+        .reg = main_register_weather_cap_group,
+    };
+
+    esp_err_t err = app_capabilities_register_external_group(&group);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    return err;
+}
+
 void app_main(void)
 {
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
     esp_log_level_set("http_reuse", ESP_LOG_WARN);
 
     ESP_LOGI(TAG, "Starting app");
+    ESP_LOGI(TAG, "V2.7.0 PRODUCT MULTITURN TOOLS build");
     ESP_LOGI(TAG, "ESP-Claw version: %s", claw_get_version());
     ESP_LOGI(TAG, "ESP-Claw git version: %s", claw_get_git_version());
     ESP_LOGI(TAG, "Edge Agent version: %s", edge_agent_get_version());
@@ -328,6 +400,25 @@ void app_main(void)
     ESP_ERROR_CHECK(app_config_load(s_config));
     app_config_to_claw(s_config, s_claw_config);
     init_timezone(app_config_get_timezone(s_config)); // no need to check error
+
+    /*
+     * OTA is a product core service and is intentionally independent of
+     * ESP-Claw/LLM. It shares the already initialized "app" settings namespace.
+     */
+    ESP_ERROR_CHECK(ota_service_init());
+    ESP_ERROR_CHECK(ota_service_start());
+
+    /*
+     * Weather is a resilient background product service. Missing QWeather
+     * credentials or a temporary network failure must never block boot.
+     * app_config_init() above also initializes the shared settings namespace
+     * used by the QWeather provider.
+     */
+    if (APP_VOICE_TRANSPORT_AB_MODE) {
+        ESP_LOGW(TAG, "V2.6.1 MIC-ASR EOTFIX A/B: weather background disabled");
+    } else {
+        init_weather_stack();
+    }
     ESP_ERROR_CHECK(esp_board_manager_init());
     ESP_ERROR_CHECK(app_claw_ui_start());
     ESP_ERROR_CHECK(app_fs_init());
@@ -407,13 +498,81 @@ void app_main(void)
         }
     }
 
-    ESP_ERROR_CHECK(app_claw_set_save_config_callback(main_save_claw_config, NULL));
-    ESP_ERROR_CHECK(app_claw_start(s_claw_config));
+
+    bool claw_runtime_started = false;
+    if (APP_VOICE_TRANSPORT_AB_MODE) {
+        ESP_LOGW(TAG,
+                 "V2.6.1 MIC-ASR EOTFIX A/B: skipping App Claw root agent/scheduler/skills");
+    } else {
+        ESP_ERROR_CHECK(app_claw_set_save_config_callback(main_save_claw_config, NULL));
+
+        /*
+         * Register product weather tools before app_claw_start() so this
+         * external group participates in ESP-Claw's normal enabled/LLM-visible
+         * capability selection.
+         */
+        ESP_ERROR_CHECK(register_weather_agent_capability());
+
+        esp_err_t claw_start_err = app_claw_start(s_claw_config);
+        claw_runtime_started = (claw_start_err == ESP_OK);
+        if (!claw_runtime_started) {
+            ESP_LOGE(TAG,
+                     "V2.5.4B fail-soft: app_claw_start failed: %s; continuing with Wi-Fi/voice runtime",
+                     esp_err_to_name(claw_start_err));
+        }
+    }
+    s_claw_runtime_started = claw_runtime_started;
 #if CONFIG_APP_CLAW_CAP_IM_LOCAL
-    ESP_ERROR_CHECK(http_server_webim_bind_im());
+    if (claw_runtime_started) {
+        esp_err_t webim_bind_err = http_server_webim_bind_im();
+        if (webim_bind_err != ESP_OK) {
+            ESP_LOGW(TAG, "Web IM bind failed: %s", esp_err_to_name(webim_bind_err));
+        }
+    } else if (!APP_VOICE_TRANSPORT_AB_MODE) {
+        ESP_LOGW(TAG, "Web IM bind skipped because App Claw runtime is unavailable");
+    }
 #endif
 
-    register_wifi_command();
+    if (APP_VOICE_TRANSPORT_AB_MODE) {
+        ESP_LOGW(TAG, "V2.6.1 MIC-ASR EOTFIX A/B: CLI command registration skipped");
+    } else {
+        register_wifi_command();
+
+        /*
+         * Keep the voice CLI as an engineering/diagnostic interface.
+         * The product Voice Service itself autostarts near the end of app_main().
+         * A missing/miswired microphone, model, or amplifier must never block boot.
+         */
+        esp_err_t voice_cmd_err = register_voice_command(app_fs_storage_base_path());
+        if (voice_cmd_err != ESP_OK) {
+            ESP_LOGW(TAG, "Voice command registration failed: %s", esp_err_to_name(voice_cmd_err));
+        }
+
+        /*
+         * Diagnostic only. The product weather service runs automatically; these
+         * commands are kept for provisioning and engineering verification.
+         */
+        esp_err_t weather_cmd_err = register_weather_command();
+        if (weather_cmd_err != ESP_OK) {
+            ESP_LOGW(TAG, "Weather command registration failed: %s", esp_err_to_name(weather_cmd_err));
+        }
+
+        /*
+         * Engineering/factory interface only. Normal deployed devices use the
+         * saved manifest URL and the background OTA worker.
+         */
+        esp_err_t ota_cmd_err = register_ota_command();
+        if (ota_cmd_err != ESP_OK) {
+            ESP_LOGW(TAG, "OTA command registration failed: %s", esp_err_to_name(ota_cmd_err));
+        }
+    }
+
+    /*
+     * If this is the first boot of an OTA image and bootloader rollback is
+     * enabled, reaching this point proves that core boot completed. ota_service
+     * then waits its validation grace period before marking the image valid.
+     */
+    ota_service_mark_boot_ready();
 
 #if APP_ENABLE_MEM_LOG
     /* Start memory monitor: print internal free, min free, PSRAM free every 20s */
@@ -421,4 +580,24 @@ void app_main(void)
 #endif
 
     app_free_runtime_state();
+
+    esp_err_t voice_dialog_err = voice_dialog_init();
+    if (voice_dialog_err != ESP_OK) {
+        ESP_LOGW(TAG, "Voice dialog init failed: %s", esp_err_to_name(voice_dialog_err));
+    }
+
+    /*
+     * Product voice autostart:
+     * start only after the boot-time app/claw config buffers are released.
+     * This must remain fail-soft; voice hardware/model/RAM failure must not
+     * abort the rest of the ESP-Claw product runtime.
+     */
+    esp_err_t voice_autostart_err = voice_service_start();
+    if (voice_autostart_err == ESP_OK) {
+        ESP_LOGI(TAG, "Voice Service autostart requested");
+    } else if (voice_autostart_err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Voice Service autostart skipped: already running/starting");
+    } else {
+        ESP_LOGW(TAG, "Voice Service autostart failed: %s", esp_err_to_name(voice_autostart_err));
+    }
 }

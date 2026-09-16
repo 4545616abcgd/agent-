@@ -1,0 +1,10 @@
+dependencies:
+  idf: ">=5.5"
+  voice_tts:
+    path: ../voice_tts
+  voice_service:
+    path: ../voice_service
+  voice_agent:
+    path: ../voice_agent
+  voice_audio:
+    path: ../voice_audio

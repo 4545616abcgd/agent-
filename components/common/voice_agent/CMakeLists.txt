@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "voice_agent.c"
+        "realtime_session.c"
+        "backends/volc_realtime_backend.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "."
+        "backends"
+    REQUIRES
+        voice_duplex_volc
+        log
+)

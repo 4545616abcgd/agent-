@@ -94,10 +94,10 @@ typedef struct {
 
 #define CLAW_MEMORY_SESSION_IDX_MAGIC 0x58444843u /* CHDX */
 #define CLAW_MEMORY_SESSION_IDX_VERSION 1
-#define CLAW_MEMORY_SESSION_COMPACT_TOOL_TURNS 1
+#define CLAW_MEMORY_SESSION_COMPACT_TOOL_TURNS 0
 #define CLAW_MEMORY_SESSION_SIZE_WARNING \
-    "Session history is still too large after compaction. Please create a new conversation by sending \
-    the command `/session new [name]`, and delete the old session by `/session delete <name>` due to limited storage space."
+    "Session history could not be recovered automatically. Please create a new conversation with " \
+    "`/session new [name]` and delete the old session with `/session delete <name>`."
 
 _Static_assert(sizeof(claw_memory_session_index_header_t) == 8,
                "session history index header size must remain fixed");
@@ -660,6 +660,29 @@ static esp_err_t session_history_mark_blocked(const char *data_path)
         err = ESP_FAIL;
     }
 
+    free(blocked_path);
+    return err;
+}
+
+static esp_err_t session_history_clear_blocked(const char *data_path)
+{
+    char *blocked_path = NULL;
+    bool deleted_any = false;
+    esp_err_t err;
+
+    if (!data_path || !data_path[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    blocked_path = session_history_blocked_path_dup(data_path);
+    if (!blocked_path) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = session_history_unlink_path(blocked_path, &deleted_any);
+    if (err == ESP_OK && deleted_any) {
+        ESP_LOGI(TAG, "cleared session history blocked marker %s", blocked_path);
+    }
     free(blocked_path);
     return err;
 }
@@ -1534,13 +1557,16 @@ static bool session_history_compact_keep_record(const claw_memory_session_turn_t
     if (!turns || turn_index >= turn_count) {
         return false;
     }
+
+    /* User intent and final answers are the durable conversational record.
+     * Tool call/result scratch is deliberately discarded once compaction is
+     * needed; repeated tool failures can otherwise dominate the entire
+     * session with little conversational value. */
     if (type == CLAW_CORE_CONTEXT_RECORD_USER ||
             type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL) {
         return true;
     }
-    if (turn_index + 1 == turn_count && !turns[turn_index].completed) {
-        return true;
-    }
+
     return turns[turn_index].keep_tool_records &&
            (type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_TOOL ||
             type == CLAW_CORE_CONTEXT_RECORD_TOOL_RESULT);
@@ -1549,6 +1575,7 @@ static bool session_history_compact_keep_record(const claw_memory_session_turn_t
 static esp_err_t session_history_plan_compaction(const claw_memory_session_index_t *index,
                                                  const claw_memory_session_turn_t *turns,
                                                  size_t turn_count,
+                                                 size_t first_turn_to_keep,
                                                  size_t *out_data_size,
                                                  size_t *out_entry_count)
 {
@@ -1557,7 +1584,9 @@ static esp_err_t session_history_plan_compaction(const claw_memory_session_index
     size_t turn_index = 0;
     size_t i;
 
-    if (!index || !turns || turn_count == 0 || !out_data_size || !out_entry_count) {
+    if (!index || !turns || turn_count == 0 ||
+            first_turn_to_keep >= turn_count ||
+            !out_data_size || !out_entry_count) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1570,6 +1599,9 @@ static esp_err_t session_history_plan_compaction(const claw_memory_session_index
 
         while (turn_index + 1 < turn_count && i >= turns[turn_index].end) {
             turn_index++;
+        }
+        if (turn_index < first_turn_to_keep) {
+            continue;
         }
         if (!session_history_compact_keep_record(turns,
                                                  turn_count,
@@ -1624,6 +1656,8 @@ static esp_err_t session_history_rewrite_compacted(const char *session_id,
     size_t compacted_entry_count = 0;
     size_t turn_count = 0;
     size_t turn_index = 0;
+    size_t first_turn_to_keep = 0;
+    size_t min_recent_turns = 0;
     uint32_t write_offset = 0;
     size_t i;
     esp_err_t err;
@@ -1637,13 +1671,59 @@ static esp_err_t session_history_rewrite_compacted(const char *session_id,
         return err;
     }
 
+    min_recent_turns = turn_count < CLAW_MEMORY_SESSION_MIN_RECENT_TURNS ?
+                       turn_count : CLAW_MEMORY_SESSION_MIN_RECENT_TURNS;
+
     err = session_history_plan_compaction(index,
                                           turns,
                                           turn_count,
+                                          first_turn_to_keep,
                                           &compacted_data_size,
                                           &compacted_entry_count);
     if (err != ESP_OK) {
         goto cleanup;
+    }
+
+    /* Prefer a compact recent-history window. Keep at least the configured
+     * number of most recent turns while trying to reach the target size. */
+    while (compacted_data_size > CLAW_MEMORY_SESSION_TARGET_SIZE &&
+            turn_count - first_turn_to_keep > min_recent_turns) {
+        first_turn_to_keep++;
+        err = session_history_plan_compaction(index,
+                                              turns,
+                                              turn_count,
+                                              first_turn_to_keep,
+                                              &compacted_data_size,
+                                              &compacted_entry_count);
+        if (err != ESP_OK) {
+            goto cleanup;
+        }
+    }
+
+    /* Emergency pass: if the protected recent window itself exceeds the hard
+     * ceiling, keep trimming oldest turns until the session is safe. */
+    while (compacted_data_size > CLAW_MEMORY_SESSION_SIZE_LIMIT &&
+            first_turn_to_keep + 1 < turn_count) {
+        first_turn_to_keep++;
+        err = session_history_plan_compaction(index,
+                                              turns,
+                                              turn_count,
+                                              first_turn_to_keep,
+                                              &compacted_data_size,
+                                              &compacted_entry_count);
+        if (err != ESP_OK) {
+            goto cleanup;
+        }
+    }
+
+    if (first_turn_to_keep > 0) {
+        ESP_LOGI(TAG,
+                 "session %s trimmed oldest %u turn(s), keeping %u/%u, compacted=%u bytes",
+                 session_id,
+                 (unsigned)first_turn_to_keep,
+                 (unsigned)(turn_count - first_turn_to_keep),
+                 (unsigned)turn_count,
+                 (unsigned)compacted_data_size);
     }
 
     if (compacted_data_size > CLAW_MEMORY_SESSION_SIZE_LIMIT) {
@@ -1656,6 +1736,7 @@ static esp_err_t session_history_rewrite_compacted(const char *session_id,
                      esp_err_to_name(block_err));
         }
         session_history_publish_size_warning(request, session_id);
+        err = ESP_ERR_INVALID_SIZE;
         goto cleanup;
     }
 
@@ -1678,6 +1759,9 @@ static esp_err_t session_history_rewrite_compacted(const char *session_id,
 
         while (turn_index + 1 < turn_count && i >= turns[turn_index].end) {
             turn_index++;
+        }
+        if (turn_index < first_turn_to_keep) {
+            continue;
         }
         if (!session_history_compact_keep_record(turns,
                                                  turn_count,
@@ -1764,6 +1848,15 @@ static esp_err_t session_history_rewrite_compacted(const char *session_id,
         goto cleanup;
     }
 
+    err = session_history_clear_blocked(data_path);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to clear recovered session marker for %s: %s",
+                 session_id,
+                 esp_err_to_name(err));
+    } else {
+        err = ESP_OK;
+    }
+
 cleanup:
     if (data_file && session_history_close_file(data_file) != ESP_OK && err == ESP_OK) {
         err = ESP_FAIL;
@@ -1781,24 +1874,82 @@ static esp_err_t session_history_compact_if_needed(const char *session_id,
                                                    const char *idx_path)
 {
     claw_memory_session_index_t index = {0};
+    size_t current_size;
+    bool was_blocked;
     esp_err_t err;
 
     if (!session_id || !data_path || !idx_path) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (file_size_bytes(data_path) <= CLAW_MEMORY_SESSION_SIZE_LIMIT) {
+
+    current_size = file_size_bytes(data_path);
+    was_blocked = session_history_session_blocked(session_id);
+
+    if (!was_blocked && current_size <= CLAW_MEMORY_SESSION_COMPACT_TRIGGER) {
         return ESP_OK;
+    }
+
+    if (!session_history_path_exists(data_path)) {
+        return session_history_clear_blocked(data_path);
     }
 
     err = session_history_validate_pair(data_path, idx_path, &index);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Resetting invalid oversized session history %s", data_path);
-        return session_history_recreate_file(data_path, idx_path);
+        err = session_history_recreate_file(data_path, idx_path);
+        if (err == ESP_OK) {
+            (void)session_history_clear_blocked(data_path);
+        }
+        return err;
     }
+
+    ESP_LOGI(TAG,
+             "compacting session %s size=%u trigger=%u blocked=%s",
+             session_id,
+             (unsigned)current_size,
+             (unsigned)CLAW_MEMORY_SESSION_COMPACT_TRIGGER,
+             was_blocked ? "true" : "false");
 
     err = session_history_rewrite_compacted(session_id, request, data_path, idx_path, &index);
     session_history_index_free(&index);
     return err;
+}
+
+static esp_err_t session_history_try_recover_blocked(const char *session_id,
+                                                     const claw_core_request_t *request)
+{
+    char *data_path = NULL;
+    char *idx_path = NULL;
+    esp_err_t err;
+
+    if (!session_id || !session_id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!session_history_session_blocked(session_id)) {
+        return ESP_OK;
+    }
+
+    data_path = claw_memory_session_path_dup(session_id);
+    if (!data_path) {
+        return ESP_ERR_NO_MEM;
+    }
+    idx_path = session_history_idx_path_dup(data_path);
+    if (!idx_path) {
+        free(data_path);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "attempting automatic recovery of blocked session %s", session_id);
+    err = session_history_compact_if_needed(session_id, request, data_path, idx_path);
+    free(data_path);
+    free(idx_path);
+
+    if (err == ESP_OK && !session_history_session_blocked(session_id)) {
+        ESP_LOGI(TAG, "blocked session %s recovered automatically", session_id);
+        return ESP_OK;
+    }
+
+    return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
 }
 
 static esp_err_t claw_memory_session_validate_batch(const claw_core_context_persist_batch_t *batch)
@@ -1853,7 +2004,10 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
         return err;
     }
     if (session_history_session_blocked(batch->session_id)) {
-        return ESP_ERR_INVALID_STATE;
+        err = session_history_try_recover_blocked(batch->session_id, batch->request);
+        if (err != ESP_OK) {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     data_path = claw_memory_session_path_dup(batch->session_id);
@@ -1868,6 +2022,15 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
     }
     if (ensure_parent_dir(data_path) != ESP_OK) {
         err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    err = session_history_compact_if_needed(batch->session_id, batch->request, data_path, idx_path);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+    if (session_history_session_blocked(batch->session_id)) {
+        err = ESP_ERR_INVALID_STATE;
         goto cleanup;
     }
 
@@ -2012,6 +2175,10 @@ esp_err_t claw_memory_request_gate_callback(const claw_core_request_t *request,
     reject_message[0] = '\0';
 
     if (!session_history_session_blocked(request->session_id)) {
+        return ESP_OK;
+    }
+
+    if (session_history_try_recover_blocked(request->session_id, request) == ESP_OK) {
         return ESP_OK;
     }
 

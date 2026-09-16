@@ -50,6 +50,7 @@
 #include "cJSON.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "app_claw_cli";
 static const size_t CAP_OUTPUT_BUF_SIZE = 1024;
@@ -731,27 +732,60 @@ esp_err_t app_claw_cli_start(void)
 {
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-
-    ESP_LOGI(TAG, "Starting console REPL");
+    esp_err_t repl_err = ESP_OK;
+    size_t internal_free;
+    size_t largest_internal;
 
     repl_config.prompt = "app> ";
-    repl_config.task_stack_size = 10240;
+    repl_config.task_stack_size = 8192;
     repl_config.max_cmdline_length = 512;
+
+    internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    ESP_LOGI(TAG, "Starting console REPL");
+    ESP_LOGI(TAG, "Before REPL: internal_free=%u largest=%u",
+             (unsigned)internal_free,
+             (unsigned)largest_internal);
+
+    /*
+     * The console REPL task stack must come from internal RAM in this build.
+     * If the largest contiguous internal block is smaller than the requested
+     * stack (plus a small allowance for task/console bookkeeping), creating
+     * the REPL is guaranteed or very likely to fail.  The CLI is optional for
+     * the product runtime, so fail soft instead of rebooting the whole device.
+     */
+    if (largest_internal < (repl_config.task_stack_size + 1024U)) {
+        ESP_LOGW(TAG,
+                 "Skipping console REPL: low/fragmented internal RAM "
+                 "(free=%u largest=%u required~=%u); continuing without CLI",
+                 (unsigned)internal_free,
+                 (unsigned)largest_internal,
+                 (unsigned)(repl_config.task_stack_size + 1024U));
+        return ESP_OK;
+    }
 
 #if CONFIG_ESP_CONSOLE_UART_DEFAULT || CONFIG_ESP_CONSOLE_UART_CUSTOM
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+    repl_err = esp_console_new_repl_uart(&hw_config, &repl_config, &repl);
 #elif CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     esp_console_dev_usb_serial_jtag_config_t hw_config =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+    repl_err = esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl);
 #elif CONFIG_ESP_CONSOLE_USB_CDC
     esp_console_dev_usb_cdc_config_t hw_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl));
+    repl_err = esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl);
 #else
-    ESP_LOGE(TAG, "No supported console backend is enabled");
-    return ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGW(TAG, "No supported console backend is enabled; continuing without CLI");
+    return ESP_OK;
 #endif
+
+    if (repl_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Console REPL creation failed: %s; continuing without CLI",
+                 esp_err_to_name(repl_err));
+        return ESP_OK;
+    }
 
     esp_console_register_help_command();
     register_cap_cli_commands();
@@ -802,5 +836,14 @@ esp_err_t app_claw_cli_start(void)
     }
 
     printf("Type 'help', 'auto rules', 'auto last', or 'auto emit_message qq_gateway qq 123 hello'\n");
-    return esp_console_start_repl(repl);
+
+    repl_err = esp_console_start_repl(repl);
+    if (repl_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Console REPL start failed: %s; continuing without CLI",
+                 esp_err_to_name(repl_err));
+        return ESP_OK;
+    }
+
+    return ESP_OK;
 }

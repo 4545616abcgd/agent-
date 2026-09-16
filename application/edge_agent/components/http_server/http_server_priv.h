@@ -16,7 +16,7 @@
 #define HTTP_SERVER_CTRL_PORT         32769
 #define HTTP_SERVER_SCRATCH_SIZE      4096
 #define HTTP_SERVER_PATH_MAX          256
-#define HTTP_SERVER_UPLOAD_MAX_SIZE   (512 * 1024)
+#define HTTP_SERVER_UPLOAD_MAX_SIZE   (6 * 1024 * 1024)
 
 typedef struct {
     httpd_handle_t server;
@@ -55,5 +55,6 @@ esp_err_t http_server_register_lua_app_routes(httpd_handle_t server);
 #endif
 esp_err_t http_server_register_wechat_routes(httpd_handle_t server);
 esp_err_t http_server_register_webim_routes(httpd_handle_t server);
+esp_err_t http_server_register_audio_routes(httpd_handle_t server);
 void http_server_webim_ws_fd_remove(int fd);
 esp_err_t http_server_captive_404_handler(httpd_req_t *req, httpd_err_code_t error);

@@ -1,0 +1,26 @@
+version: 1.0.0
+
+# Hardware-fixed peripherals for PuZhong ESP32-S3 N16R8 board
+peripherals:
+
+  # TF card SPI bus
+  # MOSI=GPIO38, MISO=GPIO40, SCK=GPIO39
+  - name: spi_shared
+    type: spi
+    role: master
+    config:
+      spi_bus_config:
+        spi_port: SPI2_HOST
+        mosi_io_num: 38
+        miso_io_num: 40
+        sclk_io_num: 39
+        max_transfer_sz: 4096
+
+  # On-board D1 LED on GPIO3
+  - name: gpio_led
+    type: gpio
+    role: io
+    config:
+      pin: 3
+      mode: GPIO_MODE_OUTPUT
+      default_level: 0

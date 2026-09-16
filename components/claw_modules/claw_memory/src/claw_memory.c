@@ -758,7 +758,14 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
 
     err = claw_memory_load_index(&index_root);
     if (err != ESP_OK) {
-        return err;
+        /* Long-term memory is optional request context. A missing/corrupt SD
+         * index must not abort the Root Agent request before the LLM runs.
+         * Keep the underlying storage/tool error semantics unchanged and only
+         * fail-soft at this automatic context-provider boundary. */
+        ESP_LOGW(TAG,
+                 "Long-term Memory unavailable, continuing without it: %s",
+                 esp_err_to_name(err));
+        return ESP_ERR_NOT_FOUND;
     }
 
     summaries = cJSON_GetObjectItem(index_root, "summaries");

@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "weather_provider_qweather.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_http_client
+        heap
+        log
+        mbedtls
+        json
+        settings
+        weather_service
+        espressif__zlib
+)

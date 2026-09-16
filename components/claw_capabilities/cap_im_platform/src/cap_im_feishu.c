@@ -26,6 +26,7 @@
 #include "esp_attr.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -57,8 +58,19 @@
 #define CAP_IM_FEISHU_MAX_CARD_CONTENT_LEN 8192
 #define CAP_IM_FEISHU_DEDUP_CACHE_SIZE 64
 #define CAP_IM_FEISHU_RECONNECT_DELAY_MS 3000
+#define CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS 60000
+#define CAP_IM_FEISHU_RECONNECT_CIRCUIT_THRESHOLD 6
+#define CAP_IM_FEISHU_RECONNECT_CIRCUIT_COOLDOWN_MS (3 * 60 * 1000)
+#define CAP_IM_FEISHU_STABLE_CONNECTION_MS 30000
 #define CAP_IM_FEISHU_INITIAL_CONNECT_TIMEOUT_MS 15000
 #define CAP_IM_FEISHU_ATTACHMENT_QUEUE_LEN 8
+#define CAP_IM_FEISHU_WS_CLIENT_STACK_SIZE (8 * 1024)
+#define CAP_IM_FEISHU_WS_SUPERVISOR_STACK_SIZE (8 * 1024)
+#define CAP_IM_FEISHU_ATTACHMENT_STACK_SIZE (8 * 1024)
+#define CAP_IM_FEISHU_MIN_INTERNAL_FREE_START (24 * 1024)
+#define CAP_IM_FEISHU_MIN_INTERNAL_LARGEST_START (10 * 1024)
+#define CAP_IM_FEISHU_MIN_INTERNAL_FREE_CONNECT (32 * 1024)
+#define CAP_IM_FEISHU_MIN_INTERNAL_LARGEST_CONNECT (10 * 1024)
 
 static const char *TAG = "cap_im_feishu";
 
@@ -156,6 +168,97 @@ static void cap_im_feishu_init_defaults(void)
 static int64_t cap_im_feishu_now_ms(void)
 {
     return esp_timer_get_time() / 1000LL;
+}
+
+static size_t cap_im_feishu_internal_free_bytes(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static size_t cap_im_feishu_internal_largest_block(void)
+{
+    return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static size_t cap_im_feishu_psram_free_bytes(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+}
+
+static bool cap_im_feishu_resources_ready(const char *phase,
+                                          size_t min_internal_free,
+                                          size_t min_internal_largest)
+{
+    size_t internal_free = cap_im_feishu_internal_free_bytes();
+    size_t internal_largest = cap_im_feishu_internal_largest_block();
+    size_t psram_free = cap_im_feishu_psram_free_bytes();
+
+    if (internal_free >= min_internal_free && internal_largest >= min_internal_largest) {
+        return true;
+    }
+
+    ESP_LOGW(TAG,
+             "Feishu %s deferred: internal_free=%u largest=%u psram_free=%u",
+             phase ? phase : "operation",
+             (unsigned)internal_free,
+             (unsigned)internal_largest,
+             (unsigned)psram_free);
+    return false;
+}
+
+static uint32_t cap_im_feishu_retry_delay_ms(uint32_t failure_count)
+{
+    uint32_t delay_ms = CAP_IM_FEISHU_RECONNECT_DELAY_MS;
+    uint32_t shifts;
+
+    if (failure_count >= CAP_IM_FEISHU_RECONNECT_CIRCUIT_THRESHOLD) {
+        return CAP_IM_FEISHU_RECONNECT_CIRCUIT_COOLDOWN_MS;
+    }
+
+    if (failure_count == 0) {
+        return delay_ms;
+    }
+
+    shifts = failure_count - 1;
+    while (shifts-- > 0 && delay_ms < CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS) {
+        if (delay_ms > CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS / 2) {
+            delay_ms = CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS;
+            break;
+        }
+        delay_ms *= 2;
+    }
+
+    if (delay_ms > CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS) {
+        delay_ms = CAP_IM_FEISHU_RECONNECT_MAX_DELAY_MS;
+    }
+    return delay_ms;
+}
+
+static void cap_im_feishu_retry_delay(uint32_t failure_count, const char *reason)
+{
+    uint32_t delay_ms = cap_im_feishu_retry_delay_ms(failure_count);
+    uint32_t remaining_ms = delay_ms;
+
+    if (failure_count >= CAP_IM_FEISHU_RECONNECT_CIRCUIT_THRESHOLD) {
+        ESP_LOGW(TAG,
+                 "Feishu reconnect circuit open after %u failures; cooling down %u ms (%s)",
+                 (unsigned)failure_count,
+                 (unsigned)delay_ms,
+                 reason ? reason : "retry");
+    } else {
+        ESP_LOGW(TAG,
+                 "Feishu reconnect backoff %u ms after failure %u (%s)",
+                 (unsigned)delay_ms,
+                 (unsigned)failure_count,
+                 reason ? reason : "retry");
+    }
+
+    while (!s_feishu.stop_requested && remaining_ms > 0) {
+        uint32_t slice_ms = remaining_ms > 250 ? 250 : remaining_ms;
+
+        vTaskDelay(pdMS_TO_TICKS(slice_ms));
+        remaining_ms -= slice_ms;
+    }
 }
 
 static uint64_t cap_im_feishu_fnv1a64(const char *text)
@@ -2430,17 +2533,39 @@ static void cap_im_feishu_ws_event_handler(void *arg,
 
 static void cap_im_feishu_ws_task(void *arg)
 {
+    uint32_t consecutive_failures = 0;
+
     (void)arg;
 
     while (!s_feishu.stop_requested) {
         int64_t connect_started_ms = 0;
+        int64_t connected_since_ms = 0;
         int64_t last_ping_ms = 0;
+        bool attempt_became_stable = false;
+        const char *failure_reason = "connection ended";
+
+        if (!cap_im_feishu_resources_ready("connect",
+                                           CAP_IM_FEISHU_MIN_INTERNAL_FREE_CONNECT,
+                                           CAP_IM_FEISHU_MIN_INTERNAL_LARGEST_CONNECT)) {
+            consecutive_failures++;
+            cap_im_feishu_retry_delay(consecutive_failures, "low internal memory");
+            continue;
+        }
 
         if (cap_im_feishu_pull_ws_config() != ESP_OK) {
             if (s_feishu.stop_requested) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(CAP_IM_FEISHU_RECONNECT_DELAY_MS));
+            consecutive_failures++;
+            cap_im_feishu_retry_delay(consecutive_failures, "endpoint config failed");
+            continue;
+        }
+
+        if (!cap_im_feishu_resources_ready("websocket start",
+                                           CAP_IM_FEISHU_MIN_INTERNAL_FREE_CONNECT,
+                                           CAP_IM_FEISHU_MIN_INTERNAL_LARGEST_CONNECT)) {
+            consecutive_failures++;
+            cap_im_feishu_retry_delay(consecutive_failures, "memory changed before websocket start");
             continue;
         }
 
@@ -2448,10 +2573,13 @@ static void cap_im_feishu_ws_task(void *arg)
             esp_websocket_client_config_t ws_config = {
                 .uri = s_feishu.ws_url,
                 .buffer_size = 2048,
-                .task_stack = 16 * 1024,
+                .task_stack = CAP_IM_FEISHU_WS_CLIENT_STACK_SIZE,
                 .reconnect_timeout_ms = s_feishu.ws_reconnect_interval_ms,
                 .network_timeout_ms = 10000,
-                .disable_auto_reconnect = false,
+                /* Reconnection is owned by this supervisor. Running both the
+                 * websocket client's retry loop and our outer retry loop can
+                 * create overlapping task/allocation pressure. */
+                .disable_auto_reconnect = true,
                 .crt_bundle_attach = esp_crt_bundle_attach,
             };
 
@@ -2461,7 +2589,8 @@ static void cap_im_feishu_ws_task(void *arg)
             if (s_feishu.stop_requested) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(CAP_IM_FEISHU_RECONNECT_DELAY_MS));
+            consecutive_failures++;
+            cap_im_feishu_retry_delay(consecutive_failures, "websocket init failed");
             continue;
         }
 
@@ -2479,7 +2608,8 @@ static void cap_im_feishu_ws_task(void *arg)
             if (s_feishu.stop_requested) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(CAP_IM_FEISHU_RECONNECT_DELAY_MS));
+            consecutive_failures++;
+            cap_im_feishu_retry_delay(consecutive_failures, "websocket task start failed");
             continue;
         }
 
@@ -2487,32 +2617,40 @@ static void cap_im_feishu_ws_task(void *arg)
         while (s_feishu.ws_client && !s_feishu.stop_requested) {
             int64_t now_ms = cap_im_feishu_now_ms();
 
-            if (s_feishu.ws_connected && now_ms - last_ping_ms >= s_feishu.ws_ping_interval_ms) {
-                cap_im_feishu_ws_frame_t ping = {0};
+            if (s_feishu.ws_connected) {
+                if (connected_since_ms == 0) {
+                    connected_since_ms = now_ms;
+                    last_ping_ms = now_ms;
+                }
+                if (!attempt_became_stable &&
+                        now_ms - connected_since_ms >= CAP_IM_FEISHU_STABLE_CONNECTION_MS) {
+                    attempt_became_stable = true;
+                    consecutive_failures = 0;
+                    ESP_LOGI(TAG, "Feishu WS connection stable; reconnect failure count reset");
+                }
+                if (now_ms - last_ping_ms >= s_feishu.ws_ping_interval_ms) {
+                    cap_im_feishu_ws_frame_t ping = {0};
 
-                ping.service = s_feishu.ws_service_id;
-                ping.header_count = 1;
-                strlcpy(ping.headers[0].key, "type", sizeof(ping.headers[0].key));
-                strlcpy(ping.headers[0].value, "ping", sizeof(ping.headers[0].value));
-                cap_im_feishu_ws_send_frame(&ping, NULL, 0, 1000);
-                last_ping_ms = now_ms;
-            }
-
-            if (!s_feishu.ws_ever_connected) {
+                    ping.service = s_feishu.ws_service_id;
+                    ping.header_count = 1;
+                    strlcpy(ping.headers[0].key, "type", sizeof(ping.headers[0].key));
+                    strlcpy(ping.headers[0].value, "ping", sizeof(ping.headers[0].value));
+                    cap_im_feishu_ws_send_frame(&ping, NULL, 0, 1000);
+                    last_ping_ms = now_ms;
+                }
+            } else if (!s_feishu.ws_ever_connected) {
                 if (!esp_websocket_client_is_connected(s_feishu.ws_client) &&
                         now_ms - connect_started_ms >= CAP_IM_FEISHU_INITIAL_CONNECT_TIMEOUT_MS) {
                     ESP_LOGW(TAG, "Feishu WS initial connect timeout");
+                    failure_reason = "initial connect timeout";
                     break;
                 }
-            } else if (!esp_websocket_client_is_connected(s_feishu.ws_client) && !s_feishu.ws_connected) {
-                if (s_feishu.ws_disconnect_since_ms == 0) {
-                    s_feishu.ws_disconnect_since_ms = now_ms;
-                }
-                if (now_ms - s_feishu.ws_disconnect_since_ms >=
-                        s_feishu.ws_reconnect_interval_ms + s_feishu.ws_reconnect_nonce_ms + 5000) {
-                    ESP_LOGW(TAG, "Feishu WS reconnect grace expired");
-                    break;
-                }
+            } else {
+                /* Auto reconnect is disabled. Once a previously connected
+                 * socket drops, tear it down and let this supervisor recreate
+                 * it after governed backoff. */
+                failure_reason = "websocket disconnected";
+                break;
             }
 
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -2524,12 +2662,23 @@ static void cap_im_feishu_ws_task(void *arg)
             s_feishu.ws_client = NULL;
         }
         s_feishu.ws_connected = false;
-        if (!s_feishu.stop_requested) {
-            vTaskDelay(pdMS_TO_TICKS(CAP_IM_FEISHU_RECONNECT_DELAY_MS));
+
+        if (s_feishu.stop_requested) {
+            break;
         }
+
+        if (!attempt_became_stable) {
+            consecutive_failures++;
+        } else {
+            /* A stable link that later drops starts a fresh retry sequence
+             * rather than inheriting failures from an old outage. */
+            consecutive_failures = 1;
+        }
+        cap_im_feishu_retry_delay(consecutive_failures, failure_reason);
     }
 
     s_feishu.ws_client = NULL;
+    s_feishu.ws_connected = false;
     s_feishu.ws_task = NULL;
     claw_task_delete(NULL);
 }
@@ -3226,11 +3375,11 @@ esp_err_t cap_im_feishu_set_attachment_config(const cap_im_feishu_attachment_con
 
 esp_err_t cap_im_feishu_start(void)
 {
+    BaseType_t ok;
+
     if (!s_feishu_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    BaseType_t ok;
 
     if (!s_feishu.app_id[0] || !s_feishu.app_secret[0]) {
         ESP_LOGW(TAG, "Feishu not configured, skip start");
@@ -3239,36 +3388,47 @@ esp_err_t cap_im_feishu_start(void)
     if (s_feishu.ws_task) {
         return ESP_OK;
     }
-    if (!s_feishu.attachment_queue) {
-        s_feishu.attachment_queue = xQueueCreate(CAP_IM_FEISHU_ATTACHMENT_QUEUE_LEN,
-                                                 sizeof(cap_im_feishu_attachment_job_t *));
-        if (!s_feishu.attachment_queue) {
-            return ESP_ERR_NO_MEM;
-        }
+
+    if (!cap_im_feishu_resources_ready("start",
+                                       CAP_IM_FEISHU_MIN_INTERNAL_FREE_START,
+                                       CAP_IM_FEISHU_MIN_INTERNAL_LARGEST_START)) {
+        return ESP_ERR_NO_MEM;
     }
-    if (!s_feishu.attachment_task) {
-        ok = claw_task_create(&(claw_task_config_t){
-                                  .name = "feishu_attach",
-                                  .stack_size = 8192,
-                                  .priority = 5,
-                                  .core_id = tskNO_AFFINITY,
-                                  .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
-                              },
-                              cap_im_feishu_attachment_task,
-                              NULL,
-                              &s_feishu.attachment_task);
-        if (ok != pdPASS) {
-            vQueueDelete(s_feishu.attachment_queue);
-            s_feishu.attachment_queue = NULL;
-            s_feishu.attachment_task = NULL;
-            return ESP_ERR_NO_MEM;
+
+    /* Attachment handling is optional. Do not reserve its queue and 8 KiB
+     * worker stack when inbound attachments are disabled. */
+    if (s_feishu.enable_inbound_attachments) {
+        if (!s_feishu.attachment_queue) {
+            s_feishu.attachment_queue = xQueueCreate(CAP_IM_FEISHU_ATTACHMENT_QUEUE_LEN,
+                                                     sizeof(cap_im_feishu_attachment_job_t *));
+            if (!s_feishu.attachment_queue) {
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        if (!s_feishu.attachment_task) {
+            ok = claw_task_create(&(claw_task_config_t){
+                                      .name = "feishu_attach",
+                                      .stack_size = CAP_IM_FEISHU_ATTACHMENT_STACK_SIZE,
+                                      .priority = 5,
+                                      .core_id = tskNO_AFFINITY,
+                                      .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
+                                  },
+                                  cap_im_feishu_attachment_task,
+                                  NULL,
+                                  &s_feishu.attachment_task);
+            if (ok != pdPASS) {
+                vQueueDelete(s_feishu.attachment_queue);
+                s_feishu.attachment_queue = NULL;
+                s_feishu.attachment_task = NULL;
+                return ESP_ERR_NO_MEM;
+            }
         }
     }
 
     s_feishu.stop_requested = false;
     ok = claw_task_create(&(claw_task_config_t){
                               .name = "feishu_ws",
-                              .stack_size = 8192,
+                              .stack_size = CAP_IM_FEISHU_WS_SUPERVISOR_STACK_SIZE,
                               .priority = 5,
                               .core_id = tskNO_AFFINITY,
                               .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
@@ -3289,6 +3449,12 @@ esp_err_t cap_im_feishu_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    ESP_LOGI(TAG,
+             "Feishu workers started internal_free=%u largest=%u psram_free=%u attachments=%s",
+             (unsigned)cap_im_feishu_internal_free_bytes(),
+             (unsigned)cap_im_feishu_internal_largest_block(),
+             (unsigned)cap_im_feishu_psram_free_bytes(),
+             s_feishu.enable_inbound_attachments ? "on" : "off");
     return ESP_OK;
 }
 

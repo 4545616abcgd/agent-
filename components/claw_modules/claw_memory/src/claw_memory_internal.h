@@ -14,25 +14,59 @@
 #include "claw_memory.h"
 #include "llm/claw_llm_runtime.h"
 
-#define CLAW_MEMORY_DEFAULT_MAX_MESSAGE_CHARS    4096
-#define CLAW_MEMORY_DEFAULT_MAX_TOOL_ITERATIONS  10
-#define CLAW_MEMORY_MAX_PATH                     192
-#define CLAW_MEMORY_MAX_SUMMARIES                3
-#define CLAW_MEMORY_MAX_LABEL_CHARS              8
-#define CLAW_MEMORY_MAX_LABEL_TEXT               40
-#define CLAW_MEMORY_MAX_ACTIVE_ITEMS             128
-#define CLAW_MEMORY_COMPACT_CHANGE_THRESHOLD     5
-#define CLAW_MEMORY_COMPACT_SIZE_THRESHOLD       (32 * 1024)
-#define CLAW_MEMORY_SESSION_SIZE_LIMIT           (150 * 1024)
-#define CLAW_MEMORY_RECALL_DEFAULT_LIMIT         8
-#define CLAW_MEMORY_RECORDS_FILE                 "memory_records.jsonl"
-#define CLAW_MEMORY_INDEX_FILE                   "memory_index.json"
-#define CLAW_MEMORY_DIGEST_FILE                  "memory_digest.log"
-#define CLAW_MEMORY_MARKDOWN_FILE                "MEMORY.md"
-#define CLAW_MEMORY_SOUL_FILE                    "soul.md"
-#define CLAW_MEMORY_IDENTITY_FILE                "identity.md"
-#define CLAW_MEMORY_USER_FILE                    "user.md"
-#define CLAW_MEMORY_AUTO_EXTRACT_MAX_ITEMS       3
+/*
+ * ESP-Claw Enhanced memory policy
+ *
+ * Session history is intentionally managed with three levels:
+ *
+ *   COMPACT_TRIGGER
+ *       Start compaction before history becomes large enough to stress
+ *       HTTP/TLS and JSON allocations.
+ *
+ *   TARGET_SIZE
+ *       After compaction, preferentially trim old turns toward this size.
+ *
+ *   SIZE_LIMIT
+ *       Absolute emergency ceiling. A session is blocked only when even
+ *       aggressive oldest-turn trimming cannot get below this value.
+ *
+ * The target is deliberately much lower than the hard limit so the agent
+ * keeps headroom for system prompts, Skills, tool schemas and runtime tool
+ * messages.
+ */
+#define CLAW_MEMORY_DEFAULT_MAX_MESSAGE_CHARS     4096
+#define CLAW_MEMORY_DEFAULT_MAX_TOOL_ITERATIONS   10
+#define CLAW_MEMORY_MAX_PATH                      192
+#define CLAW_MEMORY_MAX_SUMMARIES                 3
+#define CLAW_MEMORY_MAX_LABEL_CHARS               8
+#define CLAW_MEMORY_MAX_LABEL_TEXT                40
+#define CLAW_MEMORY_MAX_ACTIVE_ITEMS              128
+
+#define CLAW_MEMORY_COMPACT_CHANGE_THRESHOLD      5
+#define CLAW_MEMORY_COMPACT_SIZE_THRESHOLD        (32 * 1024)
+
+/*
+ * Session History 2.0
+ *
+ * Start cleaning at 80 KiB instead of waiting for the old 150 KiB hard
+ * ceiling. Try to return to roughly 64 KiB while preserving a useful recent
+ * conversational window.
+ */
+#define CLAW_MEMORY_SESSION_COMPACT_TRIGGER       (80 * 1024)
+#define CLAW_MEMORY_SESSION_TARGET_SIZE           (64 * 1024)
+#define CLAW_MEMORY_SESSION_MIN_RECENT_TURNS      8
+#define CLAW_MEMORY_SESSION_SIZE_LIMIT            (150 * 1024)
+
+#define CLAW_MEMORY_RECALL_DEFAULT_LIMIT          8
+#define CLAW_MEMORY_RECORDS_FILE                  "memory_records.jsonl"
+#define CLAW_MEMORY_INDEX_FILE                    "memory_index.json"
+#define CLAW_MEMORY_DIGEST_FILE                   "memory_digest.log"
+#define CLAW_MEMORY_MARKDOWN_FILE                 "MEMORY.md"
+#define CLAW_MEMORY_SOUL_FILE                     "soul.md"
+#define CLAW_MEMORY_IDENTITY_FILE                 "identity.md"
+#define CLAW_MEMORY_USER_FILE                     "user.md"
+#define CLAW_MEMORY_AUTO_EXTRACT_MAX_ITEMS        3
+
 typedef enum {
     CLAW_MEMORY_BACKEND_FORMAT_UNKNOWN = 0,
     CLAW_MEMORY_BACKEND_FORMAT_OPENAI = 1,

@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "cmd_weather.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        console
+        log
+        weather_service
+        weather_provider_qweather
+)

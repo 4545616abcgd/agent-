@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "hardware": "puzhong_esp32s3",
+  "channel": "stable",
+  "version": "0.1.1",
+  "url": "https://YOUR-DOMAIN/releases/0.1.1/edge_agent.bin",
+  "mandatory": false,
+  "notes": "ESP-Claw OTA V1 test release"
+}

@@ -1,0 +1,41 @@
+menu "Voice Audio"
+
+    config VOICE_AUDIO_SAMPLE_RATE
+        int "Voice sample rate (Hz)"
+        range 8000 48000
+        default 16000
+        help
+            Audio sample rate used by the INMP441 and MAX98357A.
+            Voice V1 is designed and tested for 16000 Hz.
+
+    config VOICE_AUDIO_BCLK_GPIO
+        int "I2S BCLK GPIO"
+        range 0 48
+        default 4
+
+    config VOICE_AUDIO_WS_GPIO
+        int "I2S WS/LRCLK GPIO"
+        range 0 48
+        default 5
+
+    config VOICE_AUDIO_MIC_DATA_GPIO
+        int "INMP441 SD input GPIO"
+        range 0 48
+        default 6
+
+    config VOICE_AUDIO_SPK_DATA_GPIO
+        int "MAX98357A DIN output GPIO"
+        range 0 48
+        default 17
+
+    config VOICE_AUDIO_MIC_SETTLE_MS
+        int "Microphone settle/discard time (ms)"
+        range 0 1000
+        default 300
+        help
+            After the shared I2S TX/RX clocks start, discard this amount of
+            microphone data before exposing PCM. In the current full-duplex
+            setup TX is the BCLK/WS clock master during microphone capture.
+            This covers INMP441 startup/standby recovery.
+
+endmenu

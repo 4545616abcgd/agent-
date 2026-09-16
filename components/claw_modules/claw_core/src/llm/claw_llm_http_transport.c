@@ -182,14 +182,38 @@ static void response_buffer_free(response_buffer_t *buffer)
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
-    http_request_context_t *ctx = (http_request_context_t *)evt->user_data;
+    http_request_context_t *ctx;
+
+    if (!evt) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * HTTP-reuse clients outlive an individual LLM request.  The reuse layer
+     * detaches request-scoped callbacks/user_data while a client is idle, but
+     * keep this handler defensive as well: cleanup/teardown events must never
+     * dereference a missing request context.
+     */
+    ctx = (http_request_context_t *)evt->user_data;
+    if (!ctx) {
+        return ESP_OK;
+    }
 
     if (abort_requested(ctx)) {
         return ESP_FAIL;
     }
 
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        return response_buffer_append(ctx->buffer, (const char *)evt->data, evt->data_len);
+        if (!ctx->buffer) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (evt->data_len <= 0) {
+            return ESP_OK;
+        }
+        if (!evt->data) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        return response_buffer_append(ctx->buffer, (const char *)evt->data, (size_t)evt->data_len);
     }
 
     return ESP_OK;

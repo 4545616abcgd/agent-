@@ -135,9 +135,6 @@ esp_err_t cap_mcp_server_start(void)
     http_config.stack_size = 8192;
 
     uint32_t task_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) >= http_config.stack_size) {
-        task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    }
     http_config.task_caps = task_caps;
 
     config.transport = esp_mcp_transport_http_server;

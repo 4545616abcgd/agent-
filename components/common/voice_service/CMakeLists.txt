@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "voice_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        voice_audio
+        esp-sr
+        heap
+)

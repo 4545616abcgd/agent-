@@ -1,0 +1,4 @@
+board: puzhong_esp32s3
+chip: esp32s3
+description: "PuZhong ESP32-S3 Development Board (普中ESP32S3开发板)"
+manufacturer: "PuZhong"

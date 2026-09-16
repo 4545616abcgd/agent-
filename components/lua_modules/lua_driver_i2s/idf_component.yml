@@ -1,0 +1,2 @@
+version: "1.0.0"
+description: "I2S digital microphone driver for Lua (INMP441, etc.)"

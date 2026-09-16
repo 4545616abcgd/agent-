@@ -7,6 +7,7 @@
 #include "claw_task.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,6 +15,150 @@
 #include "llm/claw_llm_http_transport.h"
 
 static const char *TAG = "claw_core";
+
+#define CLAW_CORE_TOOL_GUARD_REPEAT_WARN        2
+#define CLAW_CORE_TOOL_GUARD_REPEAT_ABORT       3
+#define CLAW_CORE_TOOL_GUARD_CONSECUTIVE_ABORT  6
+#define CLAW_CORE_TOOL_HISTORY_MAX_BYTES        (16 * 1024)
+
+static bool claw_core_ascii_contains_ci(const char *haystack, const char *needle)
+{
+    size_t needle_len;
+
+    if (!haystack || !needle || !needle[0]) {
+        return false;
+    }
+
+    needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+
+        while (i < needle_len && p[i]) {
+            unsigned char a = (unsigned char)p[i];
+            unsigned char b = (unsigned char)needle[i];
+
+            if (a >= 'A' && a <= 'Z') {
+                a = (unsigned char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (unsigned char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                break;
+            }
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool claw_core_tool_results_look_failed(const char *tool_results_json)
+{
+    if (!tool_results_json || !tool_results_json[0]) {
+        return false;
+    }
+
+    return claw_core_ascii_contains_ci(tool_results_json, "\"ok\":false") ||
+           claw_core_ascii_contains_ci(tool_results_json, "ESP_ERR_") ||
+           claw_core_ascii_contains_ci(tool_results_json, "invalid json") ||
+           claw_core_ascii_contains_ci(tool_results_json, "invalid input") ||
+           claw_core_ascii_contains_ci(tool_results_json, "\"error\"") ||
+           claw_core_ascii_contains_ci(tool_results_json, "error:") ||
+           claw_core_ascii_contains_ci(tool_results_json, "tool error") ||
+           claw_core_ascii_contains_ci(tool_results_json, "failed") ||
+           claw_core_ascii_contains_ci(tool_results_json, "failure");
+}
+
+static uint64_t claw_core_fnv1a_update(uint64_t hash, const char *text)
+{
+    const unsigned char *p;
+
+    if (!text) {
+        return hash;
+    }
+
+    p = (const unsigned char *)text;
+    while (*p) {
+        hash ^= (uint64_t)(*p++);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static uint64_t claw_core_tool_failure_fingerprint(const claw_core_llm_response_t *response,
+                                                   const char *tool_results_json)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    cJSON *root = NULL;
+    cJSON *item = NULL;
+    bool hashed_content = false;
+    size_t i;
+
+    if (!response) {
+        return hash;
+    }
+
+    for (i = 0; i < response->tool_call_count; i++) {
+        hash = claw_core_fnv1a_update(hash, response->tool_calls[i].name);
+        hash ^= 0xffu;
+        hash *= 1099511628211ULL;
+    }
+
+    /* Tool-call ids are provider generated and usually change on every retry.
+     * Hash only the durable result content when the persisted tool result can
+     * be parsed, so identical failures receive the same fingerprint. */
+    if (tool_results_json && tool_results_json[0]) {
+        root = cJSON_Parse(tool_results_json);
+    }
+
+    if (cJSON_IsArray(root)) {
+        cJSON_ArrayForEach(item, root) {
+            cJSON *content = cJSON_GetObjectItemCaseSensitive(item, "content");
+
+            if (cJSON_IsString(content) && content->valuestring) {
+                hash = claw_core_fnv1a_update(hash, content->valuestring);
+                hash ^= 0xfeu;
+                hash *= 1099511628211ULL;
+                hashed_content = true;
+            }
+        }
+    } else if (cJSON_IsObject(root)) {
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(root, "content");
+
+        if (cJSON_IsString(content) && content->valuestring) {
+            hash = claw_core_fnv1a_update(hash, content->valuestring);
+            hashed_content = true;
+        }
+    }
+
+    cJSON_Delete(root);
+
+    if (!hashed_content) {
+        hash = claw_core_fnv1a_update(hash, tool_results_json);
+    }
+    return hash;
+}
+
+static esp_err_t claw_core_append_tool_guard_note(cJSON *runtime_messages,
+                                                  uint32_t repeated_failures)
+{
+    (void)repeated_failures;
+
+    if (!runtime_messages) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return claw_core_append_user_message(
+               runtime_messages,
+               "[Tool Guard] The previous tool round failed repeatedly with the same result. "
+               "Do not repeat the same tool call or argument structure. Change strategy, "
+               "correct the schema, use a different capability, or report the blocker.");
+}
+
 
 static esp_err_t handle_pending_user_interrupts(claw_core_state_t *core,
                                                 const claw_core_request_item_t *request,
@@ -117,6 +262,9 @@ void claw_core_agent_loop_task(void *arg)
         char obs_tool_calls_csv[CLAW_CORE_OBS_CSV_MAX] = {0};
         bool original_user_persisted = false;
         bool inject_active_user = true;
+        uint64_t last_failed_round_fingerprint = 0;
+        uint32_t repeated_failure_rounds = 0;
+        uint32_t consecutive_failure_rounds = 0;
 
         if (xQueueReceive(core->request_queue, &request, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -261,6 +409,9 @@ void claw_core_agent_loop_task(void *arg)
                     goto finish_request;
                 }
                 if (drained) {
+                    last_failed_round_fingerprint = 0;
+                    repeated_failure_rounds = 0;
+                    consecutive_failure_rounds = 0;
                     continue;
                 }
             }
@@ -296,6 +447,9 @@ void claw_core_agent_loop_task(void *arg)
                     goto finish_request;
                 }
                 if (drained) {
+                    last_failed_round_fingerprint = 0;
+                    repeated_failure_rounds = 0;
+                    consecutive_failure_rounds = 0;
                     continue;
                 }
             }
@@ -323,6 +477,9 @@ void claw_core_agent_loop_task(void *arg)
                         goto finish_request;
                     }
                     if (drained) {
+                        last_failed_round_fingerprint = 0;
+                        repeated_failure_rounds = 0;
+                        consecutive_failure_rounds = 0;
                         continue;
                     }
                 }
@@ -353,6 +510,9 @@ void claw_core_agent_loop_task(void *arg)
                     goto finish_request;
                 }
                 if (drained) {
+                    last_failed_round_fingerprint = 0;
+                    repeated_failure_rounds = 0;
+                    consecutive_failure_rounds = 0;
                     continue;
                 }
             }
@@ -388,29 +548,114 @@ void claw_core_agent_loop_task(void *arg)
                 goto finish_request;
             }
 
-            if (tool_results_json && tool_results_json[0]) {
-                esp_err_t persist_err = claw_core_persist_context_tool_round_if_configured(
-                                            core,
-                                            &request.view,
-                                            assistant_tool_message_json,
-                                            tool_results_json);
+            {
+                bool tool_round_failed = claw_core_tool_results_look_failed(tool_results_json);
+                bool persist_tool_round = tool_results_json && tool_results_json[0];
 
-                if (persist_err != ESP_OK) {
+                if (tool_round_failed) {
+                    uint64_t fingerprint = claw_core_tool_failure_fingerprint(&llm_response,
+                                                                              tool_results_json);
+
+                    consecutive_failure_rounds++;
+                    if (fingerprint == last_failed_round_fingerprint &&
+                            last_failed_round_fingerprint != 0) {
+                        repeated_failure_rounds++;
+                    } else {
+                        last_failed_round_fingerprint = fingerprint;
+                        repeated_failure_rounds = 1;
+                    }
+
+                    /* Keep the first failure for diagnostics, but do not let
+                     * identical retries permanently bloat Session History. */
+                    if (repeated_failure_rounds > 1) {
+                        persist_tool_round = false;
+                    }
+                } else {
+                    last_failed_round_fingerprint = 0;
+                    repeated_failure_rounds = 0;
+                    consecutive_failure_rounds = 0;
+                }
+
+                /* Huge tool payloads are useful inside the current request but
+                 * are poor long-term conversation history. The final assistant
+                 * response remains persisted as the durable summary. */
+                if (tool_results_json &&
+                        strlen(tool_results_json) > CLAW_CORE_TOOL_HISTORY_MAX_BYTES) {
+                    persist_tool_round = false;
                     ESP_LOGW(TAG,
-                             "persist_context_tool_round failed for request=%" PRIu32
-                             " iteration=%" PRIu32 ": %s",
+                             "skip oversized tool round persistence request=%" PRIu32
+                             " iteration=%" PRIu32 " bytes=%u",
                              request.view.request_id,
                              iteration,
-                             esp_err_to_name(persist_err));
+                             (unsigned)strlen(tool_results_json));
+                }
+
+                if (persist_tool_round) {
+                    esp_err_t persist_err = claw_core_persist_context_tool_round_if_configured(
+                                                core,
+                                                &request.view,
+                                                assistant_tool_message_json,
+                                                tool_results_json);
+
+                    if (persist_err != ESP_OK) {
+                        ESP_LOGW(TAG,
+                                 "persist_context_tool_round failed for request=%" PRIu32
+                                 " iteration=%" PRIu32 ": %s",
+                                 request.view.request_id,
+                                 iteration,
+                                 esp_err_to_name(persist_err));
+                    }
+                }
+
+                if (tool_round_failed &&
+                        repeated_failure_rounds == CLAW_CORE_TOOL_GUARD_REPEAT_WARN) {
+                    esp_err_t guard_err = claw_core_append_tool_guard_note(runtime_messages,
+                                                                           repeated_failure_rounds);
+                    if (guard_err != ESP_OK) {
+                        ESP_LOGW(TAG,
+                                 "tool guard note injection failed request=%" PRIu32 ": %s",
+                                 request.view.request_id,
+                                 esp_err_to_name(guard_err));
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "tool guard requested strategy change request=%" PRIu32
+                                 " repeated_failures=%" PRIu32,
+                                 request.view.request_id,
+                                 repeated_failure_rounds);
+                    }
+                }
+
+                if (tool_round_failed &&
+                        (repeated_failure_rounds >= CLAW_CORE_TOOL_GUARD_REPEAT_ABORT ||
+                         consecutive_failure_rounds >= CLAW_CORE_TOOL_GUARD_CONSECUTIVE_ABORT)) {
+                    ESP_LOGE(TAG,
+                             "request=%" PRIu32
+                             " tool loop guard stopped repeated failures same=%" PRIu32
+                             " consecutive=%" PRIu32,
+                             request.view.request_id,
+                             repeated_failure_rounds,
+                             consecutive_failure_rounds);
+                    free(response.view.error_message);
+                    response.view.error_message = claw_utils_string_dup(
+                                                      "tool loop guard stopped repeated failing calls; "
+                                                      "inspect the last tool error and change strategy");
+                    err = ESP_ERR_INVALID_STATE;
+                    if (tool_results_json) {
+                        cJSON_free(tool_results_json);
+                        tool_results_json = NULL;
+                    }
+                    goto finish_request;
                 }
             }
+
             if (tool_results_json) {
                 cJSON_free(tool_results_json);
             }
 
             iteration++;
             if (iteration >= core->max_tool_iterations) {
-                response.view.error_message = claw_utils_string_dup("cap tool iteration limit reached");
+                response.view.error_message = claw_utils_string_dup(
+                    "tool iteration safety limit reached; simplify the plan instead of retrying");
                 err = ESP_ERR_INVALID_STATE;
                 goto finish_request;
             }

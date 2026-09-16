@@ -22,6 +22,7 @@ set(http_server_srcs
     "http_server_files_api.c"
     "http_server_wechat_api.c"
     "http_server_webim_api.c"
+    "http_server_audio_api.c"
     "http_server_json.c"
     "http_server_utils.c"
 )
@@ -33,12 +34,19 @@ set(http_server_requires
     claw_cap
     esp_http_server
     heap
+    voice_audio
+    voice_service
 )
 
 if(CONFIG_APP_CLAW_LUA_MODULE_HTTP_SERVER)
     list(APPEND http_server_srcs "http_server_lua_app_api.c")
     list(APPEND http_server_requires lua_module_http_server)
 endif()
+
+list(APPEND http_server_requires voice_tts)
+
+list(APPEND http_server_requires voice_reply_tts)
+list(APPEND http_server_requires voice_dialog)
 
 idf_component_register(
     SRCS

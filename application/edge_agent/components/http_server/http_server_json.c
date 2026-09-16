@@ -37,7 +37,7 @@ esp_err_t http_server_send_json_response(httpd_req_t *req, cJSON *root)
         return ESP_ERR_NO_MEM;
     }
 
-    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
     esp_err_t err = httpd_resp_sendstr(req, payload);
     free(payload);

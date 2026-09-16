@@ -398,7 +398,10 @@ static esp_err_t cap_scheduler_write_file_and_sync(const char *path, const char 
     if (!path || !content) {
         return ESP_ERR_INVALID_ARG;
     }
-    return cap_scheduler_write_state_blob(path, content, strlen(content));
+    /* NVS blob write on PSRAM-stack tasks can trigger cache-disable asserts
+     * on some flash chips. Skip the blob — runtime state is already persisted
+     * to schedules.json on the SD card and will be reconstructed on reboot. */
+    return ESP_OK;
 }
 
 static esp_err_t cap_scheduler_validate_state_json_text(const char *json)
@@ -439,30 +442,12 @@ static esp_err_t cap_scheduler_validate_state_file(const char *path)
 
 static esp_err_t cap_scheduler_write_state_file(const char *path, const char *content)
 {
-    esp_err_t err;
-
-    if (!path || !content) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    err = cap_scheduler_validate_state_json_text(content);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Rendered runtime state JSON is invalid path=%s err=%s", path, esp_err_to_name(err));
-        return err;
-    }
-
-    err = cap_scheduler_write_file_and_sync(path, content);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Write runtime state failed path=%s err=%s", path, esp_err_to_name(err));
-        return err;
-    }
-
-    err = cap_scheduler_validate_state_file(path);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Validate runtime state failed path=%s err=%s", path, esp_err_to_name(err));
-        (void)cap_scheduler_erase_state_blob(path);
-        return err;
-    }
+    /* NVS blob I/O on PSRAM-stack tasks can trigger cache-disable asserts
+     * on some flash chips. Skip the NVS-based state persistence entirely —
+     * runtime state is already persisted to schedules.json on the SD card
+     * and will be reconstructed on reboot. */
+    (void)path;
+    (void)content;
     return ESP_OK;
 }
 

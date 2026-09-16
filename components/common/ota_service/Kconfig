@@ -1,0 +1,67 @@
+menu "Product OTA Service"
+
+config OTA_SERVICE_HARDWARE_ID
+    string "Hardware compatibility ID"
+    default "puzhong_esp32s3"
+    help
+        Manifest hardware must match this value (or be "*").
+        Keep this stable for one PCB/hardware compatibility family.
+
+config OTA_SERVICE_DEFAULT_MANIFEST_URL
+    string "Default OTA manifest HTTPS URL"
+    default ""
+    help
+        Optional factory default. The URL can also be provisioned at runtime
+        with the `ota set manifest ...` engineering command and is stored in NVS.
+
+config OTA_SERVICE_DEFAULT_CHANNEL
+    string "Default release channel"
+    default "stable"
+
+config OTA_SERVICE_DEFAULT_AUTO_UPDATE
+    bool "Automatically install a newer compatible manifest release"
+    default n
+    help
+        Keep this disabled during bring-up. When disabled the service still
+        checks the manifest periodically but does not install automatically.
+
+config OTA_SERVICE_DEFAULT_CHECK_INTERVAL_MIN
+    int "Automatic manifest check interval (minutes)"
+    range 5 10080
+    default 360
+
+config OTA_SERVICE_INITIAL_CHECK_DELAY_SEC
+    int "Delay after boot before first automatic check (seconds)"
+    range 5 600
+    default 30
+
+config OTA_SERVICE_VALIDATE_DELAY_SEC
+    int "New-image validation grace period (seconds)"
+    range 5 300
+    default 30
+    help
+        Only used when CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is enabled.
+        The new image must reach normal app boot and stay alive for this period.
+
+config OTA_SERVICE_HTTP_TIMEOUT_MS
+    int "Manifest/firmware HTTP timeout (milliseconds)"
+    range 5000 120000
+    default 20000
+
+config OTA_SERVICE_MANIFEST_MAX_BYTES
+    int "Maximum manifest JSON size"
+    range 1024 16384
+    default 4096
+
+config OTA_SERVICE_TASK_STACK_SIZE
+    int "OTA worker task stack size"
+    range 6144 16384
+    default 10240
+
+config OTA_SERVICE_ALLOW_HTTP
+    bool "Allow insecure HTTP URLs (development only)"
+    default n
+    help
+        Production firmware should keep this disabled and use HTTPS only.
+
+endmenu

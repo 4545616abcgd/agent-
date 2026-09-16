@@ -1,0 +1,17 @@
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ESP32-S3-WROOM-1-N16R8: 16 MB Flash + 8 MB Octal PSRAM
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# I2S audio settings are intentionally not enabled in this baseline.
+# The previous GPIO15/16/17 mapping conflicts with the on-board OV2640 camera.
+# Add audio back later after choosing a non-conflicting pin assignment.
+
+# Partition CSV selection is intentionally not forced here until the
+# edge_agent project's partition-selection logic is verified.

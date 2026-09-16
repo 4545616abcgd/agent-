@@ -1,0 +1,9 @@
+dependencies:
+  idf: ">=5.5.4"
+  espressif/esp_websocket_client: "^1.6.1"
+  voice_audio:
+    path: ../voice_audio
+  settings:
+    path: ../settings
+  claw_cap:
+    path: ../../claw_modules/claw_cap

@@ -144,6 +144,12 @@ dependencies:
       - if: $CONFIG{APP_CLAW_LUA_DRIVER_I2C} == True
     path: ../../lua_modules/lua_driver_i2c
 
+  lua_driver_i2s_tx:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_LUA} == True
+      - if: $CONFIG{APP_CLAW_LUA_DRIVER_I2S_TX} == True
+    path: ../../lua_modules/lua_driver_i2s_tx
+
   lua_driver_mcpwm:
     rules:
       - if: $CONFIG{APP_CLAW_CAP_LUA} == True
@@ -173,6 +179,12 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_LUA} == True
       - if: $CONFIG{APP_CLAW_LUA_DRIVER_UART} == True
     path: ../../lua_modules/lua_driver_uart
+
+  lua_driver_i2s:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_LUA} == True
+      - if: $CONFIG{APP_CLAW_LUA_DRIVER_I2S} == True
+    path: ../../lua_modules/lua_driver_i2s
 
   # --- lua_module (higher-level modules) ---
 

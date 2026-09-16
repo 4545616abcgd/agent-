@@ -7,3 +7,5 @@ ota_1,     app,  ota_1,         ,   4M
 emote,     data, spiffs,        ,   3M
 system,    data, fat,           ,   1M
 storage,   data, fat,           ,   3M
+
+model,      data, spiffs,  0xF20000, 0xE0000

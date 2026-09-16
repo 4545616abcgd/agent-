@@ -37,6 +37,60 @@ Thumbs.db
 
 .codex
 
+# Local ESP-Claw development artifacts
+.esp_claw_backups/
+.patch_backups/
+_patch_backups/
+_backup/
+_source_exports/
+*.zip
+*.bak
+*.bak_*
+/esp_claw_source_snapshot.txt
+/edge_agent__*_merged.bin
+
+# Historical patch bundles and duplicate source exports
+/esp_claw_*/
+/payload/
+/main/
+/voice_audio/
+/voice_dialog/
+/voice_duplex_volc/
+/voice_service/
+/components/http_server/
+/components/common/components/
+/components/common/voice_audio/esp_claw_voice_audio_capture_clock_fix_v1/
+/application/edge_agent/components/voice_agent/
+/components/common/app_claw/_probe_copy.c
+
+# Local hardware references, handoff logs, and generated release material
+/1778915573927923/
+/*.pdf
+/*.docx
+/语音模块接入*.md
+/ESP-Claw_*交接记录*.md
+/API_BASIS_*.txt
+/MANIFEST.txt
+/PACKAGE_MANIFEST.txt
+/PATCH_*
+/FIX_*
+/APPLY_*
+/VERIFY_*
+/README_V*.md
+/README_V*.txt
+/README.txt
+/README_OTA_*
+/README_WEATHER_*
+/README_*.txt
+/apply_esp_*.ps1
+/collect_voice_*.ps1
+/export_source_snapshot.ps1
+/CHECK_*.py
+*.patch
+*.diff
+/tools/apply_*.ps1
+/tools/test_*.ps1
+
 # Docs
 docs/node_modules
 docs/public/d2

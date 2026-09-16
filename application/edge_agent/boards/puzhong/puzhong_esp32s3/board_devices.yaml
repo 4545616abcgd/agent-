@@ -1,0 +1,31 @@
+version: 1.0.0
+
+# Devices Configuration for PuZhong ESP32-S3 N16R8 baseline
+# Keep only hardware-safe baseline devices here.
+devices:
+
+  # microSD/TF card over SPI
+  # SD_CS=GPIO1, MOSI=GPIO38, MISO=GPIO40, SCK=GPIO39
+  - name: fs_sdcard
+    type: fs_fat
+    sub_type: spi
+    version: default
+    config:
+      vfs_config:
+        format_if_mount_failed: false
+        max_files: 5
+      sub_config:
+        cs_gpio_num: 1
+        frequency: SDMMC_FREQ_DEFAULT
+    peripherals:
+      - name: spi_shared
+
+  # On-board D1 LED
+  - name: led_gpio
+    type: gpio_ctrl
+    version: default
+    config:
+      active_level: 1
+      default_level: 0
+    peripherals:
+      - name: gpio_led

@@ -9,3 +9,18 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_LUA} == True
       - if: $CONFIG{APP_CLAW_LUA_MODULE_HTTP_SERVER} == True
     path: ../../../../components/lua_modules/lua_module_http_server
+
+  voice_service:
+    path: ../../../../components/common/voice_service
+
+  voice_tts:
+    path: ../../../../components/common/voice_tts
+
+  voice_audio:
+    path: ../../../../components/common/voice_audio
+
+  voice_reply_tts:
+    path: ../../../../components/common/voice_reply_tts
+
+  voice_dialog:
+    path: ../voice_dialog

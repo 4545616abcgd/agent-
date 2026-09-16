@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "http_server_priv.h"
+#include "voice_reply_tts.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -251,6 +252,35 @@ static esp_err_t webim_emit_outbound_json(const cap_im_local_message_t *message)
     return ESP_OK;
 }
 
+static bool webim_should_speak_reply(const cap_im_local_message_t *message)
+{
+    static const char *working_marker = "ESP-Claw is snapping on it";
+    static const char *round_marker = "[Round ";
+    static const unsigned char lobster_utf8[] = { 0xF0, 0x9F, 0xA6, 0x9E };
+
+    if (!message || !message->text || !message->text[0]) {
+        return false;
+    }
+
+    /*
+     * ESP-Claw uses lobster-prefixed outbound messages for working/stage UI
+     * notifications. They are NOT final assistant replies and must never
+     * start TTS while the Root Agent is still executing tools or persisting
+     * context to SD.
+     */
+    if (strlen(message->text) >= sizeof(lobster_utf8) &&
+        memcmp(message->text, lobster_utf8, sizeof(lobster_utf8)) == 0) {
+        return false;
+    }
+
+    /* Fallback filters in case a frontend/router changes the status prefix. */
+    if (strstr(message->text, working_marker) != NULL ||
+        strstr(message->text, round_marker) != NULL) {
+        return false;
+    }
+
+    return true;
+}
 static esp_err_t webim_outbound_cb(const cap_im_local_message_t *message, void *user_ctx)
 {
     (void)user_ctx;
@@ -263,7 +293,21 @@ static esp_err_t webim_outbound_cb(const cap_im_local_message_t *message, void *
                  message->channel, WEB_IM_CHANNEL);
         return ESP_OK;
     }
-    return webim_emit_outbound_json(message);
+    esp_err_t ws_err = webim_emit_outbound_json(message);
+
+    /*
+     * Never block Web IM / Event Router on synthesis. voice_reply_tts_enqueue()
+     * only copies text to PSRAM and starts/feeds a transient worker.
+     * TTS failure is fail-soft and must not break the Web reply.
+     */
+    if (webim_should_speak_reply(message)) {
+        esp_err_t tts_err = voice_reply_tts_enqueue(message->text);
+        if (tts_err != ESP_OK) {
+            ESP_LOGW(TAG, "reply TTS enqueue skipped: %s", esp_err_to_name(tts_err));
+        }
+    }
+
+    return ws_err;
 }
 
 esp_err_t http_server_webim_bind_im(void)

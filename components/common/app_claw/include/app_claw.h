@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -64,6 +65,18 @@ esp_err_t app_claw_update_config(const app_claw_config_t *config);
 esp_err_t app_claw_get_config(app_claw_config_t *out_config);
 esp_err_t app_claw_apply_config(const app_claw_config_t *config);
 claw_core_handle_t app_claw_get_core(void);
+
+/**
+ * Submit one text request to the existing root agent and copy its final reply.
+ *
+ * session_id == NULL/empty means single-turn.
+ * The caller owns response_buf; no Claw-owned pointer escapes this function.
+ */
+esp_err_t app_claw_ask_text(const char *text,
+                            const char *session_id,
+                            char *response_buf,
+                            size_t response_buf_size,
+                            uint32_t timeout_ms);
 esp_err_t app_claw_ui_start(void);
 esp_err_t app_claw_set_network_status(bool sta_connected, const char *ap_ssid);
 

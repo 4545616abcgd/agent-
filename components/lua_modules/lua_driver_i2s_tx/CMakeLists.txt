@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/lua_driver_i2s_tx.c"
+    INCLUDE_DIRS
+        "src"
+        "include"
+    REQUIRES
+        cap_lua
+        esp_driver_i2s
+)

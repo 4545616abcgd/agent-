@@ -24,6 +24,12 @@
 #if CONFIG_APP_CLAW_LUA_DRIVER_I2C
 #include "lua_driver_i2c.h"
 #endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S
+#include "lua_driver_i2s.h"
+#endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S_TX
+#include "lua_driver_i2s_tx.h"
+#endif
 #if CONFIG_APP_CLAW_LUA_DRIVER_MCPWM
 #include "lua_driver_mcpwm.h"
 #endif
@@ -342,6 +348,22 @@ static esp_err_t app_lua_register_i2c(const char *fatfs_base_path)
 }
 #endif
 
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S
+static esp_err_t app_lua_register_i2s(const char *fatfs_base_path)
+{
+    (void)fatfs_base_path;
+    return lua_driver_i2s_register();
+}
+#endif
+
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S_TX
+static esp_err_t app_lua_register_i2s_tx(const char *fatfs_base_path)
+{
+    (void)fatfs_base_path;
+    return lua_driver_i2s_tx_register();
+}
+#endif
+
 #if CONFIG_APP_CLAW_LUA_DRIVER_MCPWM
 static esp_err_t app_lua_register_mcpwm(const char *fatfs_base_path)
 {
@@ -618,6 +640,12 @@ static const app_lua_module_entry_t s_lua_module_entries[] = {
 #if CONFIG_APP_CLAW_LUA_DRIVER_I2C
     { "i2c", "I2C", app_lua_register_i2c },
 #endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S
+    { "i2s", "I2S", app_lua_register_i2s },
+#endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S_TX
+    { "i2s_tx", "I2S TX", app_lua_register_i2s_tx },
+#endif
 #if CONFIG_APP_CLAW_LUA_DRIVER_MCPWM
     { "mcpwm", "MCPWM", app_lua_register_mcpwm },
 #endif
@@ -730,6 +758,12 @@ static const app_lua_module_info_t s_lua_module_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_LUA_DRIVER_I2C
     { "i2c", "I2C" },
+#endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S
+    { "i2s", "I2S" },
+#endif
+#if CONFIG_APP_CLAW_LUA_DRIVER_I2S_TX
+    { "i2s_tx", "I2S TX" },
 #endif
 #if CONFIG_APP_CLAW_LUA_DRIVER_MCPWM
     { "mcpwm", "MCPWM" },

@@ -1820,6 +1820,13 @@ esp_err_t claw_cap_call(const char *id_or_name,
     }
     output[0] = '\0';
 
+    if (!s_runtime.initialized || !s_runtime.mutex) {
+        ESP_LOGE(TAG, "Capability call rejected before runtime initialization: cap=%s",
+                 id_or_name ? id_or_name : "");
+        snprintf(output, output_size, "Error: capability registry is not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     claw_cap_lock();
     descriptor_slot_index = claw_cap_find_descriptor_slot_index_locked(id_or_name);
     if (descriptor_slot_index < 0) {

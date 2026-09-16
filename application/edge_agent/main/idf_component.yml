@@ -10,8 +10,20 @@ dependencies:
   app_config:
     path: ../components/app_config
 
+  cap_weather_station:
+    path: ../../../components/claw_capabilities/cap_weather_station
+
   captive_dns:
     path: ../../../components/common/captive_dns
+
+  cmd_voice:
+    path: ../components/cmd_voice
+
+  cmd_ota:
+    path: ../components/cmd_ota
+
+  cmd_weather:
+    path: ../components/cmd_weather
 
   espressif/ramfs:
     version: "^0.1"
@@ -26,6 +38,29 @@ dependencies:
 
   http_reuse:
     path: ../../../components/common/http_reuse
+
+  ota_service:
+    path: ../../../components/common/ota_service
+
+  voice_audio:
+    path: ../../../components/common/voice_audio
+
+  voice_service:
+    path: ../../../components/common/voice_service
+  voice_duplex_volc:
+    path: ../../../components/common/voice_duplex_volc
+
+  voice_agent:
+    path: ../../../components/common/voice_agent
+
+  voice_dialog:
+    path: ../components/voice_dialog
+
+  weather_service:
+    path: ../../../components/common/weather_service
+
+  weather_provider_qweather:
+    path: ../../../components/common/weather_provider_qweather
 
   http_server:
     path: ../components/http_server

@@ -26,6 +26,7 @@
 
 #define APP_FS_RAMFS_MAX_FILES          (8)
 #define APP_FS_RAMFS_MAX_BYTES          (512 * 1024)
+#define APP_FS_V254C_VOICE_AB_CONTAINMENT (1)
 
 static const char *TAG = "app_fs";
 
@@ -202,28 +203,30 @@ static esp_err_t app_fs_init_storage(void)
     ESP_RETURN_ON_ERROR(build_recovery_path(recovery_path, sizeof(recovery_path)), TAG, "Failed to build recovery path");
 
 #if defined(CONFIG_ESP_BOARD_DEV_FS_FAT_SUPPORT)
-    // 1. Prefer an SD card that the board manager already mounted. The active
-    //    storage path becomes the card's own mount point (from the handle), so
-    //    the rest of the app follows it via app_fs_storage_base_path(). The
-    //    flash fatfs partition is left unmounted in this case. Only available
-    //    when the board manager was built with fs_fat (SD card) support.
+    /*
+     * V2.5.4B storage fail-safe:
+     * Keep the board-manager SD card mounted as an auxiliary filesystem, but
+     * never make it the product's primary writable storage.  The field logs
+     * show the card mounting successfully and then returning SDMMC 0x107 once
+     * Wi-Fi becomes active; using /sdcard as the primary store therefore turns
+     * a transient SD fault into an app_claw boot failure/reboot loop.
+     *
+     * Primary state (sessions, scheduler, memory, writable skill data) lives on
+     * the internal wear-levelled flash FATFS.  SD data is not erased or
+     * reformatted and remains available explicitly at its board mount point.
+     */
     const char *sd_mount = storage_sdcard_mount_point();
     if (sd_mount) {
-        strlcpy(s_storage_base_path, sd_mount, sizeof(s_storage_base_path));
-        ESP_LOGI(TAG, "Using SD card at '%s' as fatfs storage", s_storage_base_path);
-        esp_err_t rec = recover_missing_files(recovery_path, s_storage_base_path);
-        if (rec != ESP_OK) {
-            ESP_LOGW(TAG, "Recovery into SD card incomplete: %s", esp_err_to_name(rec));
-        }
-        log_fatfs_info(s_storage_base_path);
-        return ESP_OK;
+        ESP_LOGW(TAG,
+                 "V2.5.4B storage fail-safe: SD mounted at '%s' but internal flash is primary",
+                 sd_mount);
     }
 #endif  /* CONFIG_ESP_BOARD_DEV_FS_FAT_SUPPORT */
 
-    // 2. No usable SD card: mount the flash fatfs partition. If it is corrupt
-    //    and cannot be mounted, format it and remount.
+    // V2.5.4B: mount internal flash FATFS as the primary writable storage.
+    // If it is corrupt and cannot be mounted, format it and remount.
     esp_vfs_fat_mount_config_t mount_config = {
-        .format_if_mount_failed = true,
+        .format_if_mount_failed = APP_FS_V254C_VOICE_AB_CONTAINMENT ? false : true,
         .max_files = 8,
         .allocation_unit_size = 4096,
         .disk_status_check_enable = false,
@@ -239,12 +242,17 @@ static esp_err_t app_fs_init_storage(void)
         return err;
     }
 
-    // 3. Restore any files present under /system/.recovery but missing from the
-    //    fatfs partition (covers both a freshly formatted partition and partial
-    //    data loss). Existing files are kept as-is.
-    esp_err_t rec = recover_missing_files(recovery_path, s_storage_base_path);
-    if (rec != ESP_OK) {
-        ESP_LOGW(TAG, "Recovery into flash fatfs incomplete: %s", esp_err_to_name(rec));
+    if (APP_FS_V254C_VOICE_AB_CONTAINMENT) {
+        ESP_LOGW(TAG,
+                 "V2.5.4C storage containment: auto-format and recovery writes disabled during voice A/B");
+    } else {
+        // Restore any files present under /system/.recovery but missing from the
+        // fatfs partition (covers both a freshly formatted partition and partial
+        // data loss). Existing files are kept as-is.
+        esp_err_t rec = recover_missing_files(recovery_path, s_storage_base_path);
+        if (rec != ESP_OK) {
+            ESP_LOGW(TAG, "Recovery into flash fatfs incomplete: %s", esp_err_to_name(rec));
+        }
     }
 
     log_fatfs_info(s_storage_base_path);
@@ -283,9 +291,24 @@ static esp_err_t app_fs_init_ramfs(void)
 esp_err_t app_fs_init(void)
 {
     ESP_RETURN_ON_ERROR(app_fs_init_system(), TAG, "Failed to mount system FATFS");
-    ESP_RETURN_ON_ERROR(app_fs_init_storage(), TAG, "Failed to mount storage FATFS");
 #ifdef CONFIG_SPIRAM
+    /* V2.5.4C mounts RAMFS first so a damaged/full writable FATFS cannot block
+     * the voice transport A/B boot. */
     ESP_RETURN_ON_ERROR(app_fs_init_ramfs(), TAG, "Failed to mount RAMFS");
 #endif
+
+    esp_err_t storage_err = app_fs_init_storage();
+    if (storage_err != ESP_OK && APP_FS_V254C_VOICE_AB_CONTAINMENT) {
+#ifdef CONFIG_SPIRAM
+        strlcpy(s_storage_base_path, s_ramfs_base_path, sizeof(s_storage_base_path));
+        ESP_LOGE(TAG,
+                 "V2.5.4C storage containment: flash FATFS unavailable (%s); using RAMFS for this boot",
+                 esp_err_to_name(storage_err));
+        return ESP_OK;
+#else
+        return storage_err;
+#endif
+    }
+    ESP_RETURN_ON_ERROR(storage_err, TAG, "Failed to mount storage FATFS");
     return ESP_OK;
 }

@@ -46,7 +46,7 @@ static const char *TAG = "wifi_manager";
 #ifndef CONFIG_APP_WIFI_RETRY_MS
 #define CONFIG_APP_WIFI_RETRY_MS 10000
 #endif
-#define WIFI_RETRY_MS CONFIG_APP_WIFI_RETRY_MS
+#define WIFI_RETRY_MS ((CONFIG_APP_WIFI_RETRY_MS > 3000) ? 3000 : CONFIG_APP_WIFI_RETRY_MS)
 
 typedef enum {
     WM_STATE_OFF = 0,
@@ -254,7 +254,11 @@ static esp_err_t configure_sta_mode(const wifi_manager_config_t *config)
         sta_cfg.sta.pmf_cfg.capable = true;
         sta_cfg.sta.pmf_cfg.required = false;
 
+        /* Wi-Fi APSTA-stable fallback: provisioning AP stays continuous while STA retries.
+         * V2.5.3 STA-first could generate AP_START/AP_STOP/AP_START churn after an
+         * immediate auth failure, making the provisioning SSID hard to join. */
         s_mode = WM_STATE_APSTA;
+        ESP_LOGI(TAG, "APSTA-stable startup: provisioning AP available while STA connects");
         err = esp_wifi_set_mode(WIFI_MODE_APSTA);
         if (err != ESP_OK) return err;
         apply_ap_config();
@@ -433,6 +437,7 @@ esp_err_t wifi_manager_start(const wifi_manager_config_t *config)
         err = esp_wifi_start();
         if (err != ESP_OK) return err;
         s_wifi_started = true;
+        esp_wifi_set_ps(WIFI_PS_NONE);
     }
     return ESP_OK;
 }

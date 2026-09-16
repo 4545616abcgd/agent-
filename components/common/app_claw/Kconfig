@@ -219,6 +219,23 @@ menu "App Claw Config"
                 Enable the I2C Lua driver and keep app_claw's direct dependency
                 on lua_driver_i2c when Lua capability is enabled.
 
+        config APP_CLAW_LUA_DRIVER_I2S
+            bool "Enable I2S Lua driver"
+            default y if SOC_I2S_SUPPORTED
+            default n
+            help
+                Enable the I2S Lua driver and keep app_claw's direct dependency
+                on lua_driver_i2s when Lua capability is enabled.
+                Defaults to n on chips without I2S hardware support.
+
+        config APP_CLAW_LUA_DRIVER_I2S_TX
+            bool "Enable I2S TX Lua driver (MAX98357A etc.)"
+            default y if SOC_I2S_SUPPORTED
+            default n
+            help
+                Enable the I2S TX Lua driver for audio output via MAX98357A
+                or similar I2S DAC/amplifiers.
+
         config APP_CLAW_LUA_DRIVER_MCPWM
             bool "Enable MCPWM Lua driver"
             default y

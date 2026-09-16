@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "src/cap_weather_station.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        claw_cap
+        heap
+        weather_service
+        json
+)

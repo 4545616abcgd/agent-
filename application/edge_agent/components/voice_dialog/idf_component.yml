@@ -1,0 +1,10 @@
+dependencies:
+  idf: ">=5.5.4"
+  voice_service:
+    path: ../../../../components/common/voice_service
+  voice_agent:
+    path: ../../../../components/common/voice_agent
+  voice_reply_tts:
+    path: ../../../../components/common/voice_reply_tts
+  settings:
+    path: ../../../../components/common/settings
