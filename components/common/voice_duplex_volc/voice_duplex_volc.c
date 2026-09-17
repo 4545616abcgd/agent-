@@ -46,7 +46,7 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_ENDPOINT          "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
 #define DOUBAO_MODEL             "1.2.6.1"
 #define DOUBAO_VOICE             "zh_female_xiaohe_jupiter_bigtts"
-#define DOUBAO_BUILD_TAG         "V2.7.1-MULTITURN-MUTE-GUARD"
+#define DOUBAO_BUILD_TAG         "V2.7.2-OFFICIAL-EOT"
 #define DOUBAO_INPUT_FORMAT      "pcm"
 #define DOUBAO_OUTPUT_FORMAT     "pcm_s16le"
 #define DOUBAO_INPUT_RATE_HZ     16000U
@@ -145,7 +145,6 @@ typedef struct {
     bool tool_in_progress;
     bool tool_stage_done_pending;
     bool awaiting_tool_response;
-    bool mic_unmuted;
     esp_err_t terminal_status;
     uint32_t turn_index;
     TickType_t conversation_tick;
@@ -1524,7 +1523,6 @@ static void cleanup_session(void)
     s.downlink_resampled_zero_samples = 0;
     s.downlink_resampled_clipped_samples = 0;
     s.downlink_play_frames = 0;
-    s.mic_unmuted = false;
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -1683,27 +1681,7 @@ static void duplex_worker(void *arg)
                      (unsigned)local_turn_index);
         }
 
-        /*
-         * Seeduplex requires an explicit unmute event after a client-side
-         * microphone pause. Queueing can begin before this point, but no PCM
-         * packet may be sent until the cloud input has been unmuted again.
-         * A committed turn stays muted until resume_turn() clears commit_sent.
-         */
         bool commit_sent_now = state_flag(&s.commit_sent);
-        if (!commit_sent_now && !state_flag(&s.mic_unmuted)) {
-            status = send_simple_event("input_audio_unmute.commit");
-            if (status != ESP_OK) {
-                ESP_LOGE(TAG, "input audio unmute failed: %s", esp_err_to_name(status));
-                break;
-            }
-            portENTER_CRITICAL(&s_mux);
-            s.mic_unmuted = true;
-            portEXIT_CRITICAL(&s_mux);
-            ESP_LOGI(TAG, "cloud microphone unmuted for turn=%u",
-                     (unsigned)local_turn_index);
-            continue;
-        }
-
         bool commit_requested = state_flag(&s.commit_requested);
 
         if (!commit_sent_now) {
@@ -1815,21 +1793,14 @@ static void duplex_worker(void *arg)
                 /* Official end-of-turn: submit the fully drained audio buffer. */
                 status = send_simple_event("input_audio_buffer.commit");
                 if (status != ESP_OK) break;
-                status = send_simple_event("input_audio_mute.commit");
-                if (status != ESP_OK) {
-                    ESP_LOGE(TAG, "input audio mute failed: %s", esp_err_to_name(status));
-                    break;
-                }
                 TickType_t commit_now = xTaskGetTickCount();
                 portENTER_CRITICAL(&s_mux);
                 s.commit_sent = true;
-                s.mic_unmuted = false;
                 s.commit_tick = commit_now;
                 s.response_progress_tick = commit_now;
                 s.response_progress_events = 0;
                 portEXIT_CRITICAL(&s_mux);
-                ESP_LOGI(TAG,
-                         "input buffer committed; cloud microphone stays muted until follow-up turn");
+                ESP_LOGI(TAG, "input audio buffer committed using official end-of-turn flow");
                 ESP_LOGI(TAG, "MIC-ASR input finalized; waiting for server ASR and natural response");
 
                 /* Saving happens after paced streaming and commit, so SD latency
@@ -2151,9 +2122,6 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
     s.tool_in_progress = false;
     s.tool_stage_done_pending = false;
     s.awaiting_tool_response = false;
-    /* A newly created session starts with its audio input open. Follow-up
-     * turns explicitly unmute after the first client-side pause. */
-    s.mic_unmuted = true;
     s.turn_index = 1;
     s.conversation_tick = 0;
     s.audio_delta_events = 0;
@@ -2468,7 +2436,6 @@ esp_err_t voice_duplex_volc_resume_turn(void)
     s.tool_in_progress = false;
     s.tool_stage_done_pending = false;
     s.awaiting_tool_response = false;
-    s.mic_unmuted = false;
     s.audio_delta_events = 0;
     s.audio_delta_b64_bytes = 0;
     s.downlink_raw_abs_sum = 0;
