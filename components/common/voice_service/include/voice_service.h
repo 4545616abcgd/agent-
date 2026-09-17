@@ -68,8 +68,8 @@ typedef struct {
  *
  * Product pipeline (V2.4):
  *   WakeNet -> realtime PCM sink -> Voice Agent / cloud realtime backend.
- * Local VAD remains a turn-boundary helper; a missed local speech start no longer
- * discards an already-streamed realtime turn.
+ * Local VAD confirms speech before the realtime sink receives a short pre-roll
+ * and subsequent PCM, avoiding long leading-silence uploads and noise-only turns.
  *
  * This API itself remains explicit/start-on-request. Product builds may call
  * voice_service_start() automatically during boot. Startup must remain fail-soft:
@@ -78,8 +78,9 @@ typedef struct {
 esp_err_t voice_service_start(void);
 
 /**
- * Capture one follow-up turn without loading WakeNet or replaying the wake beep.
- * The realtime sink must already have resumed an existing cloud session.
+ * Capture one follow-up turn without loading WakeNet. A short listen cue is
+ * played before capture starts, and the realtime sink must already have
+ * resumed an existing cloud session.
  */
 esp_err_t voice_service_start_followup(void);
 

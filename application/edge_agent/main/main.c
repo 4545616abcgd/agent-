@@ -390,7 +390,7 @@ void app_main(void)
     esp_log_level_set("http_reuse", ESP_LOG_WARN);
 
     ESP_LOGI(TAG, "Starting app");
-    ESP_LOGI(TAG, "V2.7.1 MULTITURN MUTE GUARD build");
+    ESP_LOGI(TAG, "V2.8.2 MULTITURN OFFICIAL COMMIT build");
     ESP_LOGI(TAG, "ESP-Claw version: %s", claw_get_version());
     ESP_LOGI(TAG, "ESP-Claw git version: %s", claw_get_git_version());
     ESP_LOGI(TAG, "Edge Agent version: %s", edge_agent_get_version());

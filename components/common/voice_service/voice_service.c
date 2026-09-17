@@ -6,7 +6,7 @@
  * Deliberately small first integration:
  *   - direct WakeNet interface (no AFE task pair)
  *   - one microphone, 16 kHz signed PCM16 from voice_audio
- *   - local VAD turn boundaries with an 8 s no-speech follow-up window
+ *   - local VAD turn boundaries with a 10 s no-speech window
  *   - utterance stored in PSRAM, never written to SD
  *   - completed utterance handoff to the product dialog pipeline
  *   - local echo retained only as an engineering fallback when no sink is registered
@@ -37,27 +37,29 @@ static const char *TAG = "voice_service";
 #define VOICE_SERVICE_TASK_CORE              1
 #define VOICE_SERVICE_READ_TIMEOUT_MS        1000U
 
-#define VOICE_SERVICE_MAX_UTTERANCE_MS       8000U
-#define VOICE_SERVICE_WAIT_SPEECH_MS         8000U
+#define VOICE_SERVICE_MAX_UTTERANCE_MS      20000U
+#define VOICE_SERVICE_WAIT_SPEECH_MS        10000U
 #define VOICE_SERVICE_CAPTURE_BUFFER_MS       \
     (VOICE_SERVICE_WAIT_SPEECH_MS + VOICE_SERVICE_MAX_UTTERANCE_MS)
 #define VOICE_SERVICE_WAKE_GUARD_MS          128U
-#define VOICE_SERVICE_END_SILENCE_MS         480U
-#define VOICE_SERVICE_PRE_ROLL_MS            160U
-#define VOICE_SERVICE_POST_ROLL_MS           96U
+#define VOICE_SERVICE_END_SILENCE_MS        1000U
+#define VOICE_SERVICE_PRE_ROLL_MS            200U
+#define VOICE_SERVICE_POST_ROLL_MS           160U
 #define VOICE_SERVICE_WAKE_REARM_MS          1000U
+#define VOICE_SERVICE_ACK_PROMPT_TEXT         "我在"
 #define VOICE_SERVICE_ACK_TONE1_HZ           880U
-#define VOICE_SERVICE_ACK_TONE1_MS           70U
-#define VOICE_SERVICE_ACK_GAP_MS             25U
+#define VOICE_SERVICE_ACK_TONE1_MS          150U
+#define VOICE_SERVICE_ACK_GAP_MS             40U
 #define VOICE_SERVICE_ACK_TONE2_HZ           1175U
-#define VOICE_SERVICE_ACK_TONE2_MS           90U
-#define VOICE_SERVICE_ACK_AMPLITUDE          5200
+#define VOICE_SERVICE_ACK_TONE2_MS          180U
+#define VOICE_SERVICE_ACK_AMPLITUDE         15000
 
 #define VOICE_SERVICE_VAD_MIN_START_RMS      120U
 #define VOICE_SERVICE_VAD_MIN_END_RMS        80U
 #define VOICE_SERVICE_VAD_START_NOISE_X10    25U   /* 2.5 x noise floor */
 #define VOICE_SERVICE_VAD_END_NOISE_X10      18U   /* 1.8 x noise floor */
 #define VOICE_SERVICE_VAD_SPEECH_FRAMES      2U
+#define VOICE_SERVICE_VAD_CONFIRM_MS         192U
 
 #define VOICE_SERVICE_MODEL_PARTITION        "model"
 #define VOICE_SERVICE_MODEL_KEYWORD          "nihaoxiaoyi"
@@ -100,6 +102,11 @@ static voice_service_utterance_sink_fn s_utterance_sink;
 static void *s_utterance_sink_ctx;
 static voice_service_realtime_sink_t s_realtime_sink;
 static void *s_realtime_sink_ctx;
+
+extern const uint8_t s_wake_ack_pcm_start[]
+    asm("_binary_wake_ack_wozai_pcm_start");
+extern const uint8_t s_wake_ack_pcm_end[]
+    asm("_binary_wake_ack_wozai_pcm_end");
 
 static uint32_t u32_max(uint32_t a, uint32_t b)
 {
@@ -364,6 +371,7 @@ static esp_err_t playback_tone(uint32_t frequency_hz, uint32_t duration_ms)
         (uint32_t)(((uint64_t)frequency_hz << 32) / s_voice.sample_rate_hz);
     uint32_t phase = 0;
     size_t done = 0;
+    int32_t generated_peak = 0;
 
     while (done < total_samples && !stop_requested()) {
         size_t count = total_samples - done;
@@ -393,6 +401,10 @@ static esp_err_t playback_tone(uint32_t frequency_hz, uint32_t duration_ms)
             }
 
             s_voice.frame[i] = (int16_t)sample;
+            int32_t magnitude = sample < 0 ? -sample : sample;
+            if (magnitude > generated_peak) {
+                generated_peak = magnitude;
+            }
             phase += phase_step;
         }
 
@@ -401,6 +413,14 @@ static esp_err_t playback_tone(uint32_t frequency_hz, uint32_t duration_ms)
             TAG, "ack tone write failed");
         done += count;
     }
+
+    ESP_LOGI(TAG,
+             "listen cue tone queued freq=%uHz duration=%ums samples=%u peak=%d i2s_bytes=%u",
+             (unsigned)frequency_hz,
+             (unsigned)duration_ms,
+             (unsigned)done,
+             (int)generated_peak,
+             (unsigned)(done * 2U * sizeof(int32_t)));
 
     return ESP_OK;
 }
@@ -425,9 +445,45 @@ static esp_err_t playback_silence(uint32_t duration_ms)
     return ESP_OK;
 }
 
+static esp_err_t playback_wake_ack_prompt(void)
+{
+    size_t pcm_bytes = (size_t)(s_wake_ack_pcm_end - s_wake_ack_pcm_start);
+    if (pcm_bytes == 0 || (pcm_bytes % sizeof(int16_t)) != 0) {
+        ESP_LOGE(TAG, "wake ack PCM invalid bytes=%u", (unsigned)pcm_bytes);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const int16_t *pcm = (const int16_t *)(const void *)s_wake_ack_pcm_start;
+    size_t total_samples = pcm_bytes / sizeof(int16_t);
+    size_t done = 0;
+
+    while (done < total_samples && !stop_requested()) {
+        size_t count = total_samples - done;
+        if (count > s_voice.frame_samples) {
+            count = s_voice.frame_samples;
+        }
+        ESP_RETURN_ON_ERROR(
+            voice_audio_playback_write(pcm + done,
+                                       count,
+                                       VOICE_SERVICE_READ_TIMEOUT_MS),
+            TAG,
+            "wake ack PCM write failed");
+        done += count;
+    }
+
+    ESP_LOGI(TAG,
+             "listen cue voice queued text='%s' samples=%u duration=%ums",
+             VOICE_SERVICE_ACK_PROMPT_TEXT,
+             (unsigned)done,
+             (unsigned)samples_to_ms(done, s_voice.sample_rate_hz));
+    return done == total_samples ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 static esp_err_t play_wake_ack(void)
 {
-    ESP_LOGI(TAG, "WAKE acknowledged: playing listen beep");
+    ESP_LOGI(TAG,
+             "WAKE acknowledged: playing listen voice='%s'",
+             VOICE_SERVICE_ACK_PROMPT_TEXT);
 
     voice_audio_info_t audio_info = {0};
     voice_audio_get_info(&audio_info);
@@ -446,12 +502,18 @@ static esp_err_t play_wake_ack(void)
         return err;
     }
 
-    err = playback_tone(VOICE_SERVICE_ACK_TONE1_HZ, VOICE_SERVICE_ACK_TONE1_MS);
-    if (err == ESP_OK) {
-        err = playback_silence(VOICE_SERVICE_ACK_GAP_MS);
-    }
-    if (err == ESP_OK) {
-        err = playback_tone(VOICE_SERVICE_ACK_TONE2_HZ, VOICE_SERVICE_ACK_TONE2_MS);
+    err = playback_wake_ack_prompt();
+    if (err != ESP_OK && !stop_requested()) {
+        ESP_LOGW(TAG,
+                 "listen voice failed: %s; falling back to two-tone cue",
+                 esp_err_to_name(err));
+        err = playback_tone(VOICE_SERVICE_ACK_TONE1_HZ, VOICE_SERVICE_ACK_TONE1_MS);
+        if (err == ESP_OK) {
+            err = playback_silence(VOICE_SERVICE_ACK_GAP_MS);
+        }
+        if (err == ESP_OK) {
+            err = playback_tone(VOICE_SERVICE_ACK_TONE2_HZ, VOICE_SERVICE_ACK_TONE2_MS);
+        }
     }
 
     esp_err_t stop_err = voice_audio_playback_stop();
@@ -620,11 +682,21 @@ static void voice_service_task(void *arg)
         goto exit_task;
     }
 
-    err = voice_audio_capture_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "capture start failed: %s", esp_err_to_name(err));
-        status_set_error(err);
-        goto exit_task;
+    if (followup_mode) {
+        ESP_LOGI(TAG, "follow-up ready; playing listen cue before capture");
+        err = play_wake_ack();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "follow-up listen cue failed: %s", esp_err_to_name(err));
+            status_set_error(err);
+            goto exit_task;
+        }
+    } else {
+        err = voice_audio_capture_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "capture start failed: %s", esp_err_to_name(err));
+            status_set_error(err);
+            goto exit_task;
+        }
     }
 
     if (followup_mode) {
@@ -652,12 +724,14 @@ static void voice_service_task(void *arg)
 
     bool recording = followup_mode;
     bool speech_started = false;
+    bool speech_confirmed = false;
     uint32_t frames_since_wake = 0;
     uint32_t speech_frames = 0;
     uint32_t silence_frames = 0;
     size_t utterance_samples = 0;
     size_t speech_start_sample = 0;
     size_t last_speech_sample = 0;
+    size_t realtime_streamed_samples = 0;
     uint32_t frozen_noise = 1;
     uint32_t rearm_frames = 0;
     uint32_t frames_total = 0;
@@ -792,7 +866,7 @@ static void voice_service_task(void *arg)
                         realtime_started = false;
                         goto exit_task;
 #else
-                        ESP_LOGI(TAG, "V2.6.1 MIC-ASR EOTFIX: cloud ready; playing listen beep");
+                        ESP_LOGI(TAG, "V2.8.2 OFFICIAL COMMIT: cloud ready; playing listen voice");
 #endif
                     } else {
                         ESP_LOGE(TAG, "Realtime voice agent begin failed: %s",
@@ -817,35 +891,26 @@ static void voice_service_task(void *arg)
 
                 recording = true;
                 speech_started = false;
+                speech_confirmed = false;
                 frames_since_wake = 0;
                 speech_frames = 0;
                 silence_frames = 0;
                 utterance_samples = 0;
                 speech_start_sample = 0;
                 last_speech_sample = 0;
+                realtime_streamed_samples = 0;
                 status_set_state(VOICE_SERVICE_STATE_RECORDING);
 
                 ESP_LOGI(TAG,
-                         "RECORDING: local VAD enabled wait=%ums end_silence=%ums max=%ums",
+                         "RECORDING: V2.8.2 CONFIRMED VAD wait=%ums confirm=%ums end_silence=%ums max_speech=%ums",
                          (unsigned)VOICE_SERVICE_WAIT_SPEECH_MS,
+                         (unsigned)VOICE_SERVICE_VAD_CONFIRM_MS,
                          (unsigned)VOICE_SERVICE_END_SILENCE_MS,
                          (unsigned)VOICE_SERVICE_MAX_UTTERANCE_MS);
             } else {
                 update_noise_floor(rms);
             }
         } else {
-            if (realtime_started && realtime_sink.pcm) {
-                esp_err_t rt_err = realtime_sink.pcm(s_voice.frame, got, s_voice.sample_rate_hz, realtime_ctx);
-                if (rt_err != ESP_OK) {
-                    ESP_LOGE(TAG, "Realtime PCM push failed: %s; aborting this turn",
-                             esp_err_to_name(rt_err));
-                    if (realtime_sink.abort) realtime_sink.abort(realtime_ctx);
-                    realtime_started = false;
-                    status_set_error(rt_err);
-                    goto exit_task;
-                }
-            }
-
             size_t room = s_voice.utterance_capacity_samples - utterance_samples;
             size_t copy_count = got < room ? got : room;
             if (copy_count > 0) {
@@ -897,11 +962,75 @@ static void voice_service_task(void *arg)
                 }
             }
 
-            bool no_speech_timeout = !speech_started && frames_since_wake >= wait_frames;
             bool end_silence = speech_started && silence_frames >= silence_frames_needed;
             size_t speech_span_samples = utterance_samples > speech_start_sample ?
                                          utterance_samples - speech_start_sample : 0;
+            size_t active_speech_samples = last_speech_sample > speech_start_sample ?
+                                           last_speech_sample - speech_start_sample : 0;
+            size_t confirm_samples =
+                ms_to_samples(VOICE_SERVICE_VAD_CONFIRM_MS, s_voice.sample_rate_hz);
+            bool just_confirmed = false;
+            if (speech_started && !speech_confirmed &&
+                active_speech_samples >= confirm_samples) {
+                speech_confirmed = true;
+                just_confirmed = true;
+                ESP_LOGI(TAG, "VAD speech confirmed active_ms=%u",
+                         (unsigned)samples_to_ms(active_speech_samples,
+                                                 s_voice.sample_rate_hz));
+            }
+
+            if (realtime_started && realtime_sink.pcm && speech_confirmed) {
+                size_t stream_begin = realtime_streamed_samples;
+                if (just_confirmed) {
+                    size_t pre_roll =
+                        ms_to_samples(VOICE_SERVICE_PRE_ROLL_MS, s_voice.sample_rate_hz);
+                    stream_begin = speech_start_sample > pre_roll ?
+                                   speech_start_sample - pre_roll : 0;
+                }
+                while (stream_begin < utterance_samples) {
+                    size_t stream_count = utterance_samples - stream_begin;
+                    if (stream_count > s_voice.frame_samples) {
+                        stream_count = s_voice.frame_samples;
+                    }
+                    esp_err_t rt_err = realtime_sink.pcm(
+                        s_voice.utterance + stream_begin,
+                        stream_count,
+                        s_voice.sample_rate_hz,
+                        realtime_ctx);
+                    if (rt_err != ESP_OK) {
+                        ESP_LOGE(TAG, "Realtime PCM push failed: %s; aborting this turn",
+                                 esp_err_to_name(rt_err));
+                        if (realtime_sink.abort) realtime_sink.abort(realtime_ctx);
+                        realtime_started = false;
+                        status_set_error(rt_err);
+                        goto exit_task;
+                    }
+                    stream_begin += stream_count;
+                }
+                realtime_streamed_samples = utterance_samples;
+            }
+
             bool max_length = speech_started && speech_span_samples >= max_speech_samples;
+            bool utterance_complete = speech_started &&
+                                      (end_silence || max_length);
+
+            if (utterance_complete && !speech_confirmed) {
+                ESP_LOGW(TAG,
+                         "VAD transient rejected active_ms=%u required_ms=%u; still listening",
+                         (unsigned)samples_to_ms(active_speech_samples,
+                                                 s_voice.sample_rate_hz),
+                         (unsigned)VOICE_SERVICE_VAD_CONFIRM_MS);
+                speech_started = false;
+                speech_frames = 0;
+                silence_frames = 0;
+                speech_start_sample = 0;
+                last_speech_sample = 0;
+                realtime_streamed_samples = 0;
+                utterance_complete = false;
+            }
+
+            bool no_speech_timeout = !speech_started &&
+                                     frames_since_wake >= wait_frames;
 
             if (no_speech_timeout) {
                 if (realtime_started) {
@@ -941,17 +1070,20 @@ static void voice_service_task(void *arg)
                 ESP_LOGW(TAG, "VAD timeout: no command after wake; back to LISTENING");
                 recording = false;
                 speech_started = false;
+                speech_confirmed = false;
                 frames_since_wake = 0;
                 speech_frames = 0;
                 silence_frames = 0;
                 utterance_samples = 0;
+                realtime_streamed_samples = 0;
                 rearm_frames = rearm_frames_needed;
                 status_set_state(VOICE_SERVICE_STATE_LISTENING);
                 ESP_LOGI(TAG, "WakeNet re-arm cooldown=%ums", (unsigned)VOICE_SERVICE_WAKE_REARM_MS);
-            } else if (end_silence || max_length) {
+            } else if (utterance_complete) {
                 size_t pre_roll = ms_to_samples(VOICE_SERVICE_PRE_ROLL_MS, s_voice.sample_rate_hz);
                 size_t post_roll = ms_to_samples(VOICE_SERVICE_POST_ROLL_MS, s_voice.sample_rate_hz);
-                size_t begin = speech_start_sample > pre_roll ? speech_start_sample - pre_roll : 0;
+                size_t begin = speech_start_sample > pre_roll ?
+                               speech_start_sample - pre_roll : 0;
                 size_t end = last_speech_sample + post_roll;
                 if (end > utterance_samples) {
                     end = utterance_samples;
@@ -963,11 +1095,23 @@ static void voice_service_task(void *arg)
                 s_voice.last_utterance_ms = utterance_ms;
                 portEXIT_CRITICAL(&s_mux);
 
-                ESP_LOGI(TAG,
-                         "VAD speech end reason=%s captured=%ums echo=%ums",
-                         max_length ? "max" : "silence",
-                         (unsigned)samples_to_ms(utterance_samples, s_voice.sample_rate_hz),
-                         (unsigned)utterance_ms);
+                if (realtime_started) {
+                    ESP_LOGI(TAG,
+                             "MIC-ASR capture complete reason=%s frames=%u samples=%u captured_ms=%u speech_ms=%u cloud_ms=%u; stopping I2S then draining realtime uplink",
+                             max_length ? "max" : "silence",
+                             (unsigned)frames_since_wake,
+                             (unsigned)utterance_samples,
+                             (unsigned)samples_to_ms(utterance_samples, s_voice.sample_rate_hz),
+                             (unsigned)utterance_ms,
+                             (unsigned)samples_to_ms(realtime_streamed_samples,
+                                                     s_voice.sample_rate_hz));
+                } else {
+                    ESP_LOGI(TAG,
+                             "VAD speech end reason=%s captured=%ums echo=%ums",
+                             max_length ? "max" : "silence",
+                             (unsigned)samples_to_ms(utterance_samples, s_voice.sample_rate_hz),
+                             (unsigned)utterance_ms);
+                }
 
                 recording = false;
 
@@ -1001,7 +1145,9 @@ static void voice_service_task(void *arg)
                         if (realtime_sink.abort) realtime_sink.abort(realtime_ctx);
                         status_set_error(err);
                     } else {
-                        ESP_LOGI(TAG, "Realtime voice agent microphone committed");
+                        ESP_LOGI(TAG,
+                                 "MIC-ASR microphone committed dynamic_vad speech_ms=%u",
+                                 (unsigned)utterance_ms);
                     }
                     realtime_started = false;
                     goto exit_task;
@@ -1026,7 +1172,9 @@ static void voice_service_task(void *arg)
                 }
 
                 speech_started = false;
+                speech_confirmed = false;
                 utterance_samples = 0;
+                realtime_streamed_samples = 0;
                 rearm_frames = rearm_frames_needed;
                 ESP_LOGI(TAG, "WakeNet re-arm cooldown=%ums", (unsigned)VOICE_SERVICE_WAKE_REARM_MS);
                 ESP_LOGI(TAG, "LISTENING: say '%s'", s_voice.wake_word[0] ? s_voice.wake_word : "Hi,ESP");

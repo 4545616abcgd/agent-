@@ -30,7 +30,9 @@ static const char *TAG = "voice_audio";
 #define VOICE_AUDIO_SLOT_BYTES         sizeof(int32_t)
 #define VOICE_AUDIO_FRAME_BYTES        (VOICE_AUDIO_STEREO_SLOTS * VOICE_AUDIO_SLOT_BYTES)
 #define VOICE_AUDIO_PCM_BYTES          sizeof(int16_t)
-#define VOICE_AUDIO_SILENCE_MS         20U
+#define VOICE_AUDIO_START_SILENCE_MS    50U
+#define VOICE_AUDIO_TAIL_SILENCE_MS     50U
+#define VOICE_AUDIO_DMA_DRAIN_MS        12U
 #define VOICE_AUDIO_DEFAULT_TIMEOUT_MS 1000U
 
 typedef struct {
@@ -262,6 +264,10 @@ esp_err_t voice_audio_init(void)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = VOICE_AUDIO_DMA_DESC_NUM;
     chan_cfg.dma_frame_num = VOICE_AUDIO_DMA_FRAME_NUM;
+    /* A temporarily empty streaming ring must produce silence. With the ESP-IDF
+     * default (false), TX DMA repeats the last descriptor indefinitely, which
+     * turns the final vowel of a cloud chunk into a sustained hum. */
+    chan_cfg.auto_clear_after_cb = true;
 
     ESP_LOGI(TAG, "I2S DMA config: desc=%u frame_num=%u bytes_per_desc=%u bytes_per_channel=%u",
              (unsigned)VOICE_AUDIO_DMA_DESC_NUM,
@@ -314,7 +320,7 @@ esp_err_t voice_audio_init(void)
     portEXIT_CRITICAL(&s_state_mux);
 
     ESP_LOGI(TAG,
-             "ready rate=%dHz bclk=%d ws=%d mic=%d spk=%d frame=32bit-stereo",
+             "ready rate=%dHz bclk=%d ws=%d mic=%d spk=%d frame=32bit-stereo tx_underrun=zero",
              CONFIG_VOICE_AUDIO_SAMPLE_RATE,
              CONFIG_VOICE_AUDIO_BCLK_GPIO,
              CONFIG_VOICE_AUDIO_WS_GPIO,
@@ -595,8 +601,8 @@ esp_err_t voice_audio_playback_start(void)
         return err;
     }
 
-    /* Small zero pre-roll reduces power-up/click artifacts on Class-D modules. */
-    err = playback_write_silence_ms(VOICE_AUDIO_SILENCE_MS);
+    /* Keep valid clocks running long enough for the Class-D amplifier to wake. */
+    err = playback_write_silence_ms(VOICE_AUDIO_START_SILENCE_MS);
     if (err != ESP_OK) {
         (void)i2s_channel_disable(s_audio.tx);
         finish_transition(VOICE_AUDIO_STATE_IDLE);
@@ -667,7 +673,13 @@ esp_err_t voice_audio_playback_stop(void)
         try_begin_transition(VOICE_AUDIO_STATE_PLAYBACK, VOICE_AUDIO_STATE_PLAYBACK),
         ESP_ERR_INVALID_STATE, TAG, "Playback is not active or is busy");
 
-    esp_err_t tail_err = playback_write_silence_ms(VOICE_AUDIO_SILENCE_MS);
+    esp_err_t tail_err = playback_write_silence_ms(VOICE_AUDIO_TAIL_SILENCE_MS);
+    if (tail_err == ESP_OK) {
+        /* i2s_channel_write() returns after handing data to DMA. Keep TX
+         * enabled past the three-descriptor ring so the final samples reach
+         * the amplifier before i2s_channel_disable() stops BCLK/WS. */
+        vTaskDelay(pdMS_TO_TICKS(VOICE_AUDIO_DMA_DRAIN_MS));
+    }
     esp_err_t disable_err = i2s_channel_disable(s_audio.tx);
     finish_transition(VOICE_AUDIO_STATE_IDLE);
 

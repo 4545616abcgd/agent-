@@ -13,8 +13,9 @@
  *
  * The existing ESP-Claw audio HAL is intentionally left at its validated 16 kHz
  * format. Downlink 24 kHz PCM is downsampled to 16 kHz before MAX98357A output.
- * This diagnostic mode streams one fixed microphone window, then buffers cloud audio until
- * capture is committed. It does not yet implement acoustic barge-in during playback.
+ * The Voice Service streams one dynamically VAD-bounded microphone turn, then
+ * this transport buffers cloud audio until capture is committed. It does not
+ * yet implement acoustic barge-in during playback.
  */
 
 #include "voice_duplex_volc.h"
@@ -46,7 +47,7 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_ENDPOINT          "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
 #define DOUBAO_MODEL             "1.2.6.1"
 #define DOUBAO_VOICE             "zh_female_xiaohe_jupiter_bigtts"
-#define DOUBAO_BUILD_TAG         "V2.7.2-OFFICIAL-EOT"
+#define DOUBAO_BUILD_TAG         "V2.8.2-MULTITURN-OFFICIAL-COMMIT"
 #define DOUBAO_INPUT_FORMAT      "pcm"
 #define DOUBAO_OUTPUT_FORMAT     "pcm_s16le"
 #define DOUBAO_INPUT_RATE_HZ     16000U
@@ -65,8 +66,10 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_WORKER_PRIORITY   5
 #define DOUBAO_CONNECT_TIMEOUT_MS 15000U
 #define DOUBAO_SESSION_TIMEOUT_MS 10000U
+#define DOUBAO_RESPONSE_START_TIMEOUT_MS 20000U
 #define DOUBAO_RESPONSE_IDLE_TIMEOUT_MS  45000U
-#define DOUBAO_RESPONSE_TOTAL_TIMEOUT_MS 120000U
+#define DOUBAO_RESPONSE_TOTAL_TIMEOUT_MS  60000U
+#define DOUBAO_RESPONSE_DONE_GRACE_MS      7000U
 #define DOUBAO_SEND_TIMEOUT_MS    3000U
 #define DOUBAO_PLAY_TIMEOUT_MS    150U
 #define DOUBAO_UPLINK_GAIN_X        2U
@@ -95,10 +98,6 @@ static const char *TAG = "doubao_duplex";
 #define BIT_WS_ERROR       BIT2
 #define BIT_WORK_KICK      BIT3
 #define BIT_SESSION_CLOSED BIT4
-
-/* Keep instructions JSON-safe: no embedded quotes/backslashes. */
-#define DOUBAO_INSTRUCTIONS \
-    "你是 ESP-Claw 桌面助手。回答自然简短，优先一到三句话。用户询问实时天气、预报或预警时必须调用对应天气工具，绝不编造实时数据。工具返回不可用时，简短说明需要在设备网页中配置天气服务。保持当前会话上下文，支持用户连续追问。"
 
 typedef struct {
     bool initialized;
@@ -185,6 +184,7 @@ typedef struct {
     size_t diag_pcm_len;
     bool diag_pcm_truncated;
     TickType_t commit_tick;
+    TickType_t audio_done_tick;
     TickType_t response_progress_tick;
     uint32_t response_progress_events;
 
@@ -337,29 +337,11 @@ static esp_err_t send_session_create(void)
         s.tool_reply, DOUBAO_TOOL_REPLY_BYTES,
         "{\"type\":\"session.create\",\"event_id\":\"%s\","
         "\"session\":{\"model\":\"%s\","
-        "\"instructions\":\"%s\","
         "\"audio\":{"
         "\"input\":{\"format\":{\"type\":\"" DOUBAO_INPUT_FORMAT "\",\"rate\":16000}},"
         "\"output\":{\"format\":{\"type\":\"" DOUBAO_OUTPUT_FORMAT "\",\"rate\":24000},"
-        "\"voice\":\"%s\"}},"
-        "\"tools\":["
-        "{\"type\":\"function\",\"name\":\"weather_get_current\","
-        "\"description\":\"Read cached current weather. Use for current temperature humidity wind precipitation visibility cloud cover or UV.\","
-        "\"parameters\":{\"type\":\"object\",\"properties\":{}}},"
-        "{\"type\":\"function\",\"name\":\"weather_get_hourly\","
-        "\"description\":\"Read cached hourly forecast for rain timing and changes during the next 1 to 24 hours.\","
-        "\"parameters\":{\"type\":\"object\",\"properties\":{\"hours\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":24}}}},"
-        "{\"type\":\"function\",\"name\":\"weather_get_daily\","
-        "\"description\":\"Read cached daily forecast for today tomorrow or up to 7 days.\","
-        "\"parameters\":{\"type\":\"object\",\"properties\":{\"days\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":7}}}},"
-        "{\"type\":\"function\",\"name\":\"weather_get_alerts\","
-        "\"description\":\"Read cached active weather warnings and safety instructions.\","
-        "\"parameters\":{\"type\":\"object\",\"properties\":{\"include_details\":{\"type\":\"boolean\"}}}},"
-        "{\"type\":\"function\",\"name\":\"weather_get_status\","
-        "\"description\":\"Check weather provider configuration network state cache age and refresh health.\","
-        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}"
-        "]}}",
-        event_id, DOUBAO_MODEL, DOUBAO_INSTRUCTIONS, DOUBAO_VOICE);
+        "\"voice\":\"%s\"}}}}",
+        event_id, DOUBAO_MODEL, DOUBAO_VOICE);
     if (n <= 0 || n >= (int)DOUBAO_TOOL_REPLY_BYTES) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -370,7 +352,7 @@ static esp_err_t send_session_create(void)
         s.session_create_sent = true;
         portEXIT_CRITICAL(&s_mux);
         ESP_LOGI(TAG,
-                 "session.create sent build=%s profile=product-multiturn-weather model=%s input=%s/16k output=%s/24k voice=%s tools=5",
+                 "session.create sent build=%s profile=confirmed-vad-multiturn model=%s input=%s/16k output=%s/24k voice=%s tools=0",
                  DOUBAO_BUILD_TAG, DOUBAO_MODEL, DOUBAO_INPUT_FORMAT,
                  DOUBAO_OUTPUT_FORMAT, DOUBAO_VOICE);
     }
@@ -391,8 +373,8 @@ static esp_err_t send_audio_packet(const uint8_t pcm[DOUBAO_PACKET_BYTES])
     }
     s.tx_b64[olen] = '\0';
 
-    /* Append frames intentionally omit event_id. Reuse session-long PSRAM
-     * encode buffers so 50 packets/s do not churn the heap. */
+    /* The verified V2.6.0 session streamed append frames without event_id.
+     * Reuse session-long PSRAM buffers so 50 packets/s do not churn the heap. */
     int n = snprintf(s.tx_json, DOUBAO_TX_JSON_CAP,
                      "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}",
                      s.tx_b64);
@@ -1191,6 +1173,7 @@ static void process_server_event(const char *json)
             if (err != ESP_OK) set_terminal_error(err);
         }
     } else if (TYPE_IS("response.output_audio.done")) {
+        TickType_t audio_done_now = xTaskGetTickCount();
         uint32_t chunks;
         uint32_t b64_bytes;
         portENTER_CRITICAL(&s_mux);
@@ -1221,6 +1204,7 @@ static void process_server_event(const char *json)
                  (unsigned)raw_clip);
         portENTER_CRITICAL(&s_mux);
         s.audio_done = true;
+        s.audio_done_tick = audio_done_now;
         portEXIT_CRITICAL(&s_mux);
         if (s.events) xEventGroupSetBits(s.events, BIT_WORK_KICK);
     } else if (TYPE_IS("response.done")) {
@@ -1479,6 +1463,7 @@ static void cleanup_session(void)
     s.diag_pcm_len = 0;
     s.diag_pcm_truncated = false;
     s.commit_tick = 0;
+    s.audio_done_tick = 0;
     s.response_progress_tick = 0;
     s.response_progress_events = 0;
     s.rx_head = s.rx_tail = s.rx_len = 0;
@@ -1790,9 +1775,12 @@ static void duplex_worker(void *arg)
                          (unsigned)DOUBAO_UPLINK_GAIN_X, (unsigned)tx_gain_clipped,
                          (unsigned)mean_abs, (unsigned)tx_peak);
 
-                /* Official end-of-turn: submit the fully drained audio buffer. */
+                /* Official Seeduplex end-of-turn flow. Local accepting_input
+                 * gates microphone writes while TTS is playing, so cloud-side
+                 * mute/unmute events are neither needed nor sent. */
                 status = send_simple_event("input_audio_buffer.commit");
                 if (status != ESP_OK) break;
+                ESP_LOGI(TAG, "input_audio_buffer.commit sent (official end-of-turn)");
                 TickType_t commit_now = xTaskGetTickCount();
                 portENTER_CRITICAL(&s_mux);
                 s.commit_sent = true;
@@ -1800,8 +1788,7 @@ static void duplex_worker(void *arg)
                 s.response_progress_tick = commit_now;
                 s.response_progress_events = 0;
                 portEXIT_CRITICAL(&s_mux);
-                ESP_LOGI(TAG, "input audio buffer committed using official end-of-turn flow");
-                ESP_LOGI(TAG, "MIC-ASR input finalized; waiting for server ASR and natural response");
+                ESP_LOGI(TAG, "MIC-ASR input finalized; waiting for server ASR and response");
 
                 /* Saving happens after paced streaming and commit, so SD latency
                  * cannot distort the 20 ms uplink schedule. */
@@ -1912,7 +1899,20 @@ static void duplex_worker(void *arg)
         bool response_done = state_flag(&s.response_done);
         bool audio_done = state_flag(&s.audio_done);
         bool audio_started = state_flag(&s.audio_started);
-        if (response_done && rx_len_snapshot() < 6U && (audio_done || !audio_started)) {
+        TickType_t audio_done_at;
+        bool fallback_allowed;
+        portENTER_CRITICAL(&s_mux);
+        audio_done_at = s.audio_done_tick;
+        fallback_allowed = s.asr_completed && s.asr_text_seen &&
+                           !s.tool_pending && !s.tool_in_progress &&
+                           !s.tool_stage_done_pending && !s.awaiting_tool_response;
+        portEXIT_CRITICAL(&s_mux);
+        bool response_done_fallback = !response_done && audio_started && audio_done &&
+                                      fallback_allowed && audio_done_at != 0 &&
+                                      (xTaskGetTickCount() - audio_done_at) >=
+                                          pdMS_TO_TICKS(DOUBAO_RESPONSE_DONE_GRACE_MS);
+        if ((response_done || response_done_fallback) && rx_len_snapshot() < 6U &&
+            (audio_done || !audio_started)) {
             uint32_t rs_samples, rs_peak, rs_zero, rs_clip, rs_frames;
             uint64_t rs_abs;
             int64_t rs_sum;
@@ -1929,6 +1929,11 @@ static void duplex_worker(void *arg)
             asr_completed = s.asr_completed;
             asr_text_seen = s.asr_text_seen;
             portEXIT_CRITICAL(&s_mux);
+            if (response_done_fallback) {
+                ESP_LOGW(TAG,
+                         "response.done missing %ums after complete audio; accepting validated turn",
+                         (unsigned)DOUBAO_RESPONSE_DONE_GRACE_MS);
+            }
             ESP_LOGI(TAG,
                      "downlink resampled16 summary frames=%u samples=%u mean_abs=%u peak=%u dc=%d zero_permille=%u clipped=%u",
                      (unsigned)rs_frames, (unsigned)rs_samples,
@@ -2013,6 +2018,18 @@ static void duplex_worker(void *arg)
             }
             uint32_t total_ms = (uint32_t)((response_now - committed_at) * portTICK_PERIOD_MS);
             uint32_t idle_ms = (uint32_t)((response_now - progressed_at) * portTICK_PERIOD_MS);
+            bool response_started = state_flag(&s.response_started) ||
+                                    state_flag(&s.audio_started) ||
+                                    state_flag(&s.asr_completed);
+            if (!response_started &&
+                (response_now - committed_at) >
+                    pdMS_TO_TICKS(DOUBAO_RESPONSE_START_TIMEOUT_MS)) {
+                ESP_LOGE(TAG,
+                         "response start timeout total=%u ms progress_events=%u",
+                         (unsigned)total_ms, (unsigned)progress_events);
+                status = ESP_ERR_TIMEOUT;
+                break;
+            }
             if ((response_now - committed_at) > pdMS_TO_TICKS(DOUBAO_RESPONSE_TOTAL_TIMEOUT_MS)) {
                 ESP_LOGE(TAG,
                          "response total timeout total=%u ms idle=%u ms progress_events=%u",
@@ -2070,7 +2087,7 @@ esp_err_t voice_duplex_volc_init(const voice_duplex_volc_config_t *config)
     s.done = config->done;
     s.done_ctx = config->user_ctx;
     portEXIT_CRITICAL(&s_mux);
-    ESP_LOGI(TAG, "initialized endpoint=%s build=%s mode=product-multiturn-tools",
+    ESP_LOGI(TAG, "initialized endpoint=%s build=%s mode=official-commit-multiturn",
              DOUBAO_ENDPOINT, DOUBAO_BUILD_TAG);
     return ESP_OK;
 }
@@ -2145,6 +2162,7 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
     s.diag_pcm_len = 0;
     s.diag_pcm_truncated = false;
     s.commit_tick = 0;
+    s.audio_done_tick = 0;
     s.response_progress_tick = 0;
     s.response_progress_events = 0;
     s.tx_head = s.tx_tail = s.tx_len = 0;
@@ -2465,6 +2483,7 @@ esp_err_t voice_duplex_volc_resume_turn(void)
     s.diag_pcm_len = 0;
     s.diag_pcm_truncated = false;
     s.commit_tick = 0;
+    s.audio_done_tick = 0;
     s.response_progress_tick = 0;
     s.response_progress_events = 0;
     if (s.tool_event) {

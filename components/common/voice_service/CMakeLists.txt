@@ -7,4 +7,6 @@ idf_component_register(
         voice_audio
         esp-sr
         heap
+    EMBED_FILES
+        "assets/wake_ack_wozai.pcm"
 )
