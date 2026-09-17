@@ -46,7 +46,7 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_ENDPOINT          "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
 #define DOUBAO_MODEL             "1.2.6.1"
 #define DOUBAO_VOICE             "zh_female_xiaohe_jupiter_bigtts"
-#define DOUBAO_BUILD_TAG         "V2.7.0-PRODUCT-MULTITURN-TOOLS"
+#define DOUBAO_BUILD_TAG         "V2.7.1-MULTITURN-MUTE-GUARD"
 #define DOUBAO_INPUT_FORMAT      "pcm"
 #define DOUBAO_OUTPUT_FORMAT     "pcm_s16le"
 #define DOUBAO_INPUT_RATE_HZ     16000U
@@ -1687,8 +1687,10 @@ static void duplex_worker(void *arg)
          * Seeduplex requires an explicit unmute event after a client-side
          * microphone pause. Queueing can begin before this point, but no PCM
          * packet may be sent until the cloud input has been unmuted again.
+         * A committed turn stays muted until resume_turn() clears commit_sent.
          */
-        if (!state_flag(&s.mic_unmuted)) {
+        bool commit_sent_now = state_flag(&s.commit_sent);
+        if (!commit_sent_now && !state_flag(&s.mic_unmuted)) {
             status = send_simple_event("input_audio_unmute.commit");
             if (status != ESP_OK) {
                 ESP_LOGE(TAG, "input audio unmute failed: %s", esp_err_to_name(status));
@@ -1703,7 +1705,6 @@ static void duplex_worker(void *arg)
         }
 
         bool commit_requested = state_flag(&s.commit_requested);
-        bool commit_sent_now = state_flag(&s.commit_sent);
 
         if (!commit_sent_now) {
             size_t queued = tx_len_snapshot();
@@ -1827,7 +1828,8 @@ static void duplex_worker(void *arg)
                 s.response_progress_tick = commit_now;
                 s.response_progress_events = 0;
                 portEXIT_CRITICAL(&s_mux);
-                ESP_LOGI(TAG, "input buffer committed and cloud microphone muted");
+                ESP_LOGI(TAG,
+                         "input buffer committed; cloud microphone stays muted until follow-up turn");
                 ESP_LOGI(TAG, "MIC-ASR input finalized; waiting for server ASR and natural response");
 
                 /* Saving happens after paced streaming and commit, so SD latency
