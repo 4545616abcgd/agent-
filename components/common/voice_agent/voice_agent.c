@@ -140,7 +140,7 @@ esp_err_t voice_agent_stop_session(void)
     esp_err_t err = realtime_session_commit();
     if (err == ESP_OK) {
         set_state(VOICE_AGENT_WAITING_RESPONSE);
-        ESP_LOGI(TAG, "microphone committed; waiting for realtime response");
+        ESP_LOGI(TAG, "microphone capture closed; transport commit queued");
     }
     return err;
 }

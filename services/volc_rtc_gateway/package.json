@@ -1,0 +1,14 @@
+{
+  "name": "esp-claw-volc-rtc-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Issues short-lived RTC sessions and starts Volcengine VoiceChat for ESP-Claw devices.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  }
+}

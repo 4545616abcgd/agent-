@@ -41,7 +41,10 @@ esp_err_t voice_duplex_volc_wait_ready(uint32_t timeout_ms);
 /** Push signed PCM16 mono samples captured by Voice Service. Non-blocking. */
 esp_err_t voice_duplex_volc_push_pcm(const int16_t *samples, size_t sample_count);
 
-/** Finish microphone input. Buffered audio is drained, then input_audio_buffer.commit is sent. */
+/**
+ * Finish local microphone input. Buffered PCM is drained, then exactly one
+ * input_audio_buffer.commit event is sent for this turn.
+ */
 esp_err_t voice_duplex_volc_commit(void);
 
 /** Open microphone input for the next turn on the existing cloud session. */

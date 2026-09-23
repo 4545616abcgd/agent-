@@ -1,0 +1,63 @@
+{
+  "AgentConfig": {
+    "WelcomeMessage": "我在。",
+    "EnableConversationStateCallback": true
+  },
+  "Config": {
+    "ASRConfig": {
+      "Provider": "volcano",
+      "ProviderParams": {
+        "Mode": "bigmodel",
+        "AppId": "${ASR_APP_ID}",
+        "AccessToken": "${ASR_ACCESS_TOKEN}",
+        "ApiResourceId": "volc.bigasr.sauc.duration",
+        "StreamMode": 0
+      },
+      "VADConfig": {
+        "SilenceTime": 800
+      },
+      "VolumeGain": 0.3,
+      "InterruptConfig": {
+        "InterruptSpeechDuration": 0,
+        "InterruptKeywords": []
+      },
+      "TurnDetectionMode": 0
+    },
+    "TTSConfig": {
+      "Provider": "volcano_bidirection",
+      "ProviderParams": {
+        "app": {
+          "appid": "${TTS_APP_ID}",
+          "token": "${TTS_ACCESS_TOKEN}"
+        },
+        "ResourceId": "volc.service_type.10029",
+        "audio": {
+          "voice_type": "zh_female_xiaohe_jupiter_bigtts",
+          "pitch_rate": 0,
+          "speech_rate": 0
+        },
+        "Additions": {
+          "enable_latex_tn": false,
+          "disable_markdown_filter": true,
+          "enable_language_detector": false
+        }
+      },
+      "IgnoreBracketText": [1, 2, 3, 4, 5]
+    },
+    "LLMConfig": {
+      "Mode": "ArkV3",
+      "EndPointId": "${ARK_ENDPOINT_ID}",
+      "SystemMessages": [
+        "你是 ESP-Claw 桌面智能伴侣。使用自然、简洁的中文回答，优先直接回应用户，不重复自我介绍。"
+      ],
+      "UserPrompts": [],
+      "HistoryLength": 10,
+      "Temperature": 0.3,
+      "MaxTokens": 1024,
+      "TopP": 0.7,
+      "Prefill": false,
+      "ThinkingType": "disabled"
+    },
+    "InterruptMode": 0
+  }
+}

@@ -866,7 +866,7 @@ static void voice_service_task(void *arg)
                         realtime_started = false;
                         goto exit_task;
 #else
-                        ESP_LOGI(TAG, "V2.8.2 OFFICIAL COMMIT: cloud ready; playing listen voice");
+                        ESP_LOGI(TAG, "V3.1.0 SERVER VAD HALF DUPLEX: cloud ready; playing listen voice");
 #endif
                     } else {
                         ESP_LOGE(TAG, "Realtime voice agent begin failed: %s",
@@ -902,7 +902,7 @@ static void voice_service_task(void *arg)
                 status_set_state(VOICE_SERVICE_STATE_RECORDING);
 
                 ESP_LOGI(TAG,
-                         "RECORDING: V2.8.2 CONFIRMED VAD wait=%ums confirm=%ums end_silence=%ums max_speech=%ums",
+                         "RECORDING: V3.1.0 CONFIRMED VAD wait=%ums confirm=%ums end_silence=%ums max_speech=%ums",
                          (unsigned)VOICE_SERVICE_WAIT_SPEECH_MS,
                          (unsigned)VOICE_SERVICE_VAD_CONFIRM_MS,
                          (unsigned)VOICE_SERVICE_END_SILENCE_MS,
@@ -1123,7 +1123,7 @@ static void voice_service_task(void *arg)
                 if (realtime_started) {
                     err = voice_audio_capture_stop();
                     if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "capture stop before realtime commit failed: %s", esp_err_to_name(err));
+                        ESP_LOGE(TAG, "capture stop before realtime finalization failed: %s", esp_err_to_name(err));
                         if (realtime_sink.abort) realtime_sink.abort(realtime_ctx);
                         realtime_started = false;
                         status_set_error(err);
@@ -1134,19 +1134,19 @@ static void voice_service_task(void *arg)
                     if (audio_info.initialized && audio_info.state == VOICE_AUDIO_STATE_IDLE) {
                         esp_err_t deinit_err = voice_audio_deinit();
                         if (deinit_err != ESP_OK) {
-                            ESP_LOGW(TAG, "audio deinit before realtime commit failed: %s",
+                            ESP_LOGW(TAG, "audio deinit before realtime finalization failed: %s",
                                      esp_err_to_name(deinit_err));
                         }
                     }
                     release_sr_resources();
                     err = realtime_sink.end(realtime_ctx);
                     if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Realtime voice agent commit failed: %s", esp_err_to_name(err));
+                        ESP_LOGE(TAG, "Realtime voice agent finalization failed: %s", esp_err_to_name(err));
                         if (realtime_sink.abort) realtime_sink.abort(realtime_ctx);
                         status_set_error(err);
                     } else {
                         ESP_LOGI(TAG,
-                                 "MIC-ASR microphone committed dynamic_vad speech_ms=%u",
+                                 "MIC-ASR local microphone turn finalized dynamic_vad speech_ms=%u",
                                  (unsigned)utterance_ms);
                     }
                     realtime_started = false;

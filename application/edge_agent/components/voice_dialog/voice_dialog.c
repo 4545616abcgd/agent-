@@ -300,6 +300,6 @@ esp_err_t voice_dialog_init(void)
                  esp_err_to_name(preload_err));
     }
 
-    ESP_LOGI(TAG, "V2.7 multi-turn realtime adapter ready; legacy ASR/TTS wake path disabled");
+    ESP_LOGI(TAG, "V3.1 server-VAD multi-turn adapter ready; legacy ASR/TTS wake path disabled");
     return ESP_OK;
 }

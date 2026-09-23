@@ -7,26 +7,25 @@
  *   wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue
  *   X-Api-Key authentication
  *   session.create
- *   input_audio_buffer.append (base64 PCM16/16 kHz, official 20 ms / 640 bytes pacing)
- *   input_audio_buffer.commit
+ *   input_audio_buffer.append (base64 PCM16/16 kHz, 20 ms / 640 bytes pacing)
+ *   input_audio_buffer.commit (one event after the local VAD-bounded turn)
  *   response.output_audio.delta (base64 PCM16LE/24 kHz, requested as pcm_s16le)
  *
  * The existing ESP-Claw audio HAL is intentionally left at its validated 16 kHz
  * format. Downlink 24 kHz PCM is downsampled to 16 kHz before MAX98357A output.
- * The Voice Service streams one dynamically VAD-bounded microphone turn, then
- * this transport buffers cloud audio until capture is committed. It does not
- * yet implement acoustic barge-in during playback.
+ * The Voice Service streams one dynamically VAD-bounded microphone turn. The
+ * transport drains that PCM, commits the cloud input once, then remains silent
+ * while receiving and playing the response. After playback has drained, the
+ * same cloud session is reused for the next local turn.
  */
 
 #include "voice_duplex_volc.h"
 
-#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #include "cJSON.h"
 #include "claw_cap.h"
@@ -47,7 +46,7 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_ENDPOINT          "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
 #define DOUBAO_MODEL             "1.2.6.1"
 #define DOUBAO_VOICE             "zh_female_xiaohe_jupiter_bigtts"
-#define DOUBAO_BUILD_TAG         "V2.8.2-MULTITURN-OFFICIAL-COMMIT"
+#define DOUBAO_BUILD_TAG         "V3.1.0-SERVER-VAD-HALF-DUPLEX"
 #define DOUBAO_INPUT_FORMAT      "pcm"
 #define DOUBAO_OUTPUT_FORMAT     "pcm_s16le"
 #define DOUBAO_INPUT_RATE_HZ     16000U
@@ -57,13 +56,15 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_PACKET_BYTES      (DOUBAO_PACKET_SAMPLES * sizeof(int16_t))
 #define DOUBAO_TX_B64_CAP         ((((DOUBAO_PACKET_BYTES + 2U) / 3U) * 4U) + 4U)
 #define DOUBAO_TX_JSON_CAP        (DOUBAO_TX_B64_CAP + 176U)
-#define DOUBAO_TX_RING_BYTES     (320U * 1024U)
+#define DOUBAO_TX_RING_BYTES     (128U * 1024U)
 #define DOUBAO_RX_RING_BYTES     (512U * 1024U)
 #define DOUBAO_EVENT_MAX_BYTES   (256U * 1024U)
 #define DOUBAO_WS_BUFFER_BYTES     32768
 #define DOUBAO_WS_TASK_STACK     4096
 #define DOUBAO_WORKER_STACK      6144
 #define DOUBAO_WORKER_PRIORITY   5
+#define DOUBAO_UPLINK_STACK      5120
+#define DOUBAO_UPLINK_PRIORITY   6
 #define DOUBAO_CONNECT_TIMEOUT_MS 15000U
 #define DOUBAO_SESSION_TIMEOUT_MS 10000U
 #define DOUBAO_RESPONSE_START_TIMEOUT_MS 20000U
@@ -73,8 +74,11 @@ static const char *TAG = "doubao_duplex";
 #define DOUBAO_SEND_TIMEOUT_MS    3000U
 #define DOUBAO_PLAY_TIMEOUT_MS    150U
 #define DOUBAO_UPLINK_GAIN_X        2U
-#define DOUBAO_MAX_TURNS             6U
-#define DOUBAO_CONVERSATION_MAX_MS 90000U
+#define DOUBAO_SERVER_VAD_TAIL_MS 1200U
+#define DOUBAO_SERVER_VAD_TAIL_PACKETS \
+    ((DOUBAO_SERVER_VAD_TAIL_MS + DOUBAO_PACKET_MS - 1U) / DOUBAO_PACKET_MS)
+#define DOUBAO_MAX_TURNS            20U
+#define DOUBAO_CONVERSATION_MAX_MS 300000U
 #define DOUBAO_TOOL_EVENT_BYTES   (12U * 1024U)
 #define DOUBAO_TOOL_OUTPUT_BYTES  (32U * 1024U)
 #define DOUBAO_TOOL_REPLY_BYTES   (64U * 1024U)
@@ -87,17 +91,13 @@ static const char *TAG = "doubao_duplex";
 /* Session-long scratch buffer for base64 audio decoding (no per-packet malloc). */
 #define DOUBAO_AUDIO_DECODE_BUF   (128U * 1024U)
 #define DOUBAO_API_KEY_MAX        256U
-#define DOUBAO_DIAG_PCM_BYTES      (128U * 1024U)
-#define DOUBAO_DIAG_DIR            "/sdcard/voice_diag"
-#define DOUBAO_DIAG_WAV_PATH       "/sdcard/voice_diag/uplink_last.wav"
-#define DOUBAO_DIAG_RAM_WAV_PATH   "/ramfs/uplink_last.wav"
-#define DOUBAO_DIAG_SYS_WAV_PATH   "/system/uplink_last.wav"
-
 #define BIT_WS_CONNECTED   BIT0
 #define BIT_SESSION_READY  BIT1
 #define BIT_WS_ERROR       BIT2
 #define BIT_WORK_KICK      BIT3
 #define BIT_SESSION_CLOSED BIT4
+#define BIT_UPLINK_STOPPED BIT5
+#define BIT_UPLINK_KICK    BIT6
 
 typedef struct {
     bool initialized;
@@ -150,6 +150,7 @@ typedef struct {
 
     esp_websocket_client_handle_t ws;
     TaskHandle_t worker;
+    TaskHandle_t uplink_worker;
     EventGroupHandle_t events;
 
     uint8_t *tx_ring;
@@ -178,11 +179,6 @@ typedef struct {
     char *tool_output;
     char *tool_reply;
 
-    /* V2.5 baseline: exact PCM bytes placed on the wire, kept in PSRAM and
-     * written to WAV only after the paced uplink is complete. */
-    uint8_t *diag_pcm;
-    size_t diag_pcm_len;
-    bool diag_pcm_truncated;
     TickType_t commit_tick;
     TickType_t audio_done_tick;
     TickType_t response_progress_tick;
@@ -205,6 +201,8 @@ typedef struct {
 static duplex_ctx_t s;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_event_counter;
+static StaticTask_t s_uplink_task_tcb;
+static StackType_t s_uplink_task_stack[DOUBAO_UPLINK_STACK];
 
 static void mark_response_progress(void);
 
@@ -301,7 +299,8 @@ static void set_terminal_error(esp_err_t err)
     }
     portEXIT_CRITICAL(&s_mux);
     if (s.events) {
-        xEventGroupSetBits(s.events, BIT_WS_ERROR | BIT_WORK_KICK);
+        xEventGroupSetBits(s.events,
+                           BIT_WS_ERROR | BIT_WORK_KICK | BIT_UPLINK_KICK);
     }
 }
 
@@ -963,90 +962,6 @@ static esp_err_t rx_write_audio_base64(const char *b64, size_t b64_len)
     return ESP_OK;
 }
 
-static void wav_put_le16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xffU);
-    p[1] = (uint8_t)((v >> 8) & 0xffU);
-}
-
-static void wav_put_le32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xffU);
-    p[1] = (uint8_t)((v >> 8) & 0xffU);
-    p[2] = (uint8_t)((v >> 16) & 0xffU);
-    p[3] = (uint8_t)((v >> 24) & 0xffU);
-}
-
-static bool write_diag_wav_file(const char *path, const uint8_t *h, size_t h_len,
-                                const uint8_t *data, size_t data_len)
-{
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        ESP_LOGW(TAG, "baseline WAV open failed path=%s errno=%d", path, errno);
-        return false;
-    }
-    size_t h_written = fwrite(h, 1, h_len, fp);
-    size_t d_written = fwrite(data, 1, data_len, fp);
-    int close_rc = fclose(fp);
-    if (h_written != h_len || d_written != data_len || close_rc != 0) {
-        ESP_LOGW(TAG, "baseline WAV write short path=%s header=%u/%u data=%u/%u close=%d",
-                 path, (unsigned)h_written, (unsigned)h_len,
-                 (unsigned)d_written, (unsigned)data_len, close_rc);
-        return false;
-    }
-    ESP_LOGI(TAG,
-             "baseline WAV saved path=%s bytes=%u audio_ms=%u truncated=%d",
-             path, (unsigned)data_len,
-             (unsigned)((data_len * 1000U) / (DOUBAO_INPUT_RATE_HZ * 2U)),
-             s.diag_pcm_truncated ? 1 : 0);
-    return true;
-}
-
-static void save_uplink_diag_wav(void)
-{
-    if (!s.diag_pcm || s.diag_pcm_len < 2U) {
-        ESP_LOGW(TAG, "baseline WAV not saved: no outbound PCM captured");
-        return;
-    }
-
-    size_t data_len = s.diag_pcm_len & ~(size_t)1U;
-    if (data_len > UINT32_MAX - 44U) {
-        ESP_LOGW(TAG, "baseline WAV too large bytes=%u", (unsigned)data_len);
-        return;
-    }
-
-    uint8_t h[44] = {0};
-    memcpy(h + 0, "RIFF", 4);
-    wav_put_le32(h + 4, (uint32_t)(36U + data_len));
-    memcpy(h + 8, "WAVE", 4);
-    memcpy(h + 12, "fmt ", 4);
-    wav_put_le32(h + 16, 16U);
-    wav_put_le16(h + 20, 1U);
-    wav_put_le16(h + 22, 1U);
-    wav_put_le32(h + 24, DOUBAO_INPUT_RATE_HZ);
-    wav_put_le32(h + 28, DOUBAO_INPUT_RATE_HZ * 2U);
-    wav_put_le16(h + 32, 2U);
-    wav_put_le16(h + 34, 16U);
-    memcpy(h + 36, "data", 4);
-    wav_put_le32(h + 40, (uint32_t)data_len);
-
-    /* Baseline diagnostics must not touch the flaky SD path unless RAMFS and
-     * /system are both unavailable; SD I/O errors have already caused unrelated
-     * boot/runtime failures in field logs. */
-    if (write_diag_wav_file(DOUBAO_DIAG_RAM_WAV_PATH, h, sizeof(h), s.diag_pcm, data_len)) {
-        return;
-    }
-    ESP_LOGW(TAG, "baseline WAV RAMFS save unavailable; trying /system");
-    if (write_diag_wav_file(DOUBAO_DIAG_SYS_WAV_PATH, h, sizeof(h), s.diag_pcm, data_len)) {
-        return;
-    }
-    ESP_LOGW(TAG, "baseline WAV internal save unavailable; trying SD last");
-    bool sd_dir_ok = (mkdir(DOUBAO_DIAG_DIR, 0775) == 0 || errno == EEXIST);
-    if (sd_dir_ok) {
-        (void)write_diag_wav_file(DOUBAO_DIAG_WAV_PATH, h, sizeof(h), s.diag_pcm, data_len);
-    }
-}
-
 static uint32_t ms_since_commit(void)
 {
     TickType_t tick;
@@ -1104,7 +1019,10 @@ static void process_server_event(const char *json)
             s.session_create_sent = true;
             portEXIT_CRITICAL(&s_mux);
         }
-        if (s.events) xEventGroupSetBits(s.events, BIT_SESSION_READY | BIT_WORK_KICK);
+        if (s.events) {
+            xEventGroupSetBits(s.events,
+                               BIT_SESSION_READY | BIT_WORK_KICK | BIT_UPLINK_KICK);
+        }
     } else if (TYPE_IS("conversation.item.input_audio_transcription.started")) {
         ESP_LOGI(TAG, "ASR started after_commit=%ums", (unsigned)ms_since_commit());
     } else if (TYPE_IS("conversation.item.input_audio_transcription.delta")) {
@@ -1256,7 +1174,10 @@ static void websocket_event_handler(void *handler_args,
 
     if (event_id == WEBSOCKET_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "websocket connected");
-        if (s.events) xEventGroupSetBits(s.events, BIT_WS_CONNECTED | BIT_WORK_KICK);
+        if (s.events) {
+            xEventGroupSetBits(s.events,
+                               BIT_WS_CONNECTED | BIT_WORK_KICK | BIT_UPLINK_KICK);
+        }
         return;
     }
     if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
@@ -1400,6 +1321,26 @@ static size_t resample_24k_to_16k(const uint8_t *src, size_t src_bytes,
     return out;
 }
 
+static void wait_for_uplink_stop(void)
+{
+    TaskHandle_t task;
+    EventGroupHandle_t events;
+    portENTER_CRITICAL(&s_mux);
+    task = s.uplink_worker;
+    events = s.events;
+    portEXIT_CRITICAL(&s_mux);
+    if (!task || !events) {
+        return;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        events, BIT_UPLINK_STOPPED, pdFALSE, pdFALSE,
+        pdMS_TO_TICKS(DOUBAO_SEND_TIMEOUT_MS + 3000U));
+    if (!(bits & BIT_UPLINK_STOPPED)) {
+        ESP_LOGE(TAG, "uplink task did not stop within shutdown deadline");
+    }
+}
+
 static void cleanup_session(void)
 {
     /* Stop accepting producer writes before any session-owned buffer is freed. */
@@ -1408,6 +1349,13 @@ static void cleanup_session(void)
     /* Suppress the expected disconnect callback generated by client_stop(). */
     s.close_requested = true;
     portEXIT_CRITICAL(&s_mux);
+    if (s.events) {
+        xEventGroupSetBits(s.events, BIT_WORK_KICK | BIT_UPLINK_KICK);
+    }
+
+    /* The uplink task owns tx_b64/tx_json and can be inside a bounded WebSocket
+     * send. Join it before closing the socket or freeing session buffers. */
+    wait_for_uplink_stop();
 
     if (s.playback_started) {
         (void)voice_audio_playback_stop();
@@ -1444,8 +1392,6 @@ static void cleanup_session(void)
     s.tool_output = NULL;
     free(s.tool_reply);
     s.tool_reply = NULL;
-    free(s.diag_pcm);
-    s.diag_pcm = NULL;
     free(s.tx_ring);
     s.tx_ring = NULL;
     free(s.rx_ring);
@@ -1460,8 +1406,6 @@ static void cleanup_session(void)
     s.capture_zero_samples = 0;
     s.capture_clipped_samples = 0;
     s.capture_push_calls = 0;
-    s.diag_pcm_len = 0;
-    s.diag_pcm_truncated = false;
     s.commit_tick = 0;
     s.audio_done_tick = 0;
     s.response_progress_tick = 0;
@@ -1470,6 +1414,7 @@ static void cleanup_session(void)
     s.active = false;
     s.accepting_input = false;
     s.worker = NULL;
+    s.uplink_worker = NULL;
     /* A new conversation must start from a clean protocol state. */
     s.commit_requested = false;
     s.commit_sent = false;
@@ -1541,19 +1486,17 @@ static void notify_turn_done_once(esp_err_t status)
     }
 }
 
-static void duplex_worker(void *arg)
+static void duplex_uplink_worker(void *arg)
 {
     (void)arg;
     esp_err_t status = ESP_OK;
-    TickType_t start_tick = xTaskGetTickCount();
-    TickType_t session_tick = 0;
     TickType_t next_audio_tick = 0;
+    TickType_t first_tx_tick = 0;
+    TickType_t last_tx_tick = 0;
     uint32_t tx_send_sum_ms = 0;
     uint32_t tx_send_count = 0;
     uint32_t tx_send_min_ms = UINT32_MAX;
     uint32_t tx_send_max_ms = 0;
-    TickType_t first_tx_tick = 0;
-    TickType_t last_tx_tick = 0;
     uint32_t tx_packets = 0;
     uint32_t tx_source_bytes = 0;
     uint32_t tx_wire_bytes = 0;
@@ -1565,8 +1508,297 @@ static void duplex_worker(void *arg)
     uint32_t tx_samples = 0;
     uint32_t tx_peak = 0;
     uint32_t tx_gain_clipped = 0;
-    uint32_t local_turn_index = 1;
+    uint32_t tx_tail_silence_packets = 0;
+    uint32_t local_turn_index = 0;
     uint8_t packet[DOUBAO_PACKET_BYTES];
+
+    ESP_LOGI(TAG,
+             "half-duplex uplink task ready packet_ms=%u packet_bytes=%u ring=%u stack=%u priority=%u",
+             (unsigned)DOUBAO_PACKET_MS, (unsigned)DOUBAO_PACKET_BYTES,
+             (unsigned)DOUBAO_TX_RING_BYTES, (unsigned)DOUBAO_UPLINK_STACK,
+             (unsigned)DOUBAO_UPLINK_PRIORITY);
+
+    for (;;) {
+        bool abort_requested;
+        bool close_requested;
+        esp_err_t terminal;
+        portENTER_CRITICAL(&s_mux);
+        abort_requested = s.abort_requested;
+        close_requested = s.close_requested;
+        terminal = s.terminal_status;
+        portEXIT_CRITICAL(&s_mux);
+        if (abort_requested || close_requested || terminal != ESP_OK) {
+            break;
+        }
+
+        EventBits_t bits = s.events ? xEventGroupGetBits(s.events) : 0;
+        if ((bits & (BIT_WS_CONNECTED | BIT_SESSION_READY)) !=
+            (BIT_WS_CONNECTED | BIT_SESSION_READY)) {
+            if (s.events) {
+                xEventGroupWaitBits(s.events,
+                                    BIT_SESSION_READY | BIT_WS_ERROR,
+                                    pdFALSE, pdFALSE, pdMS_TO_TICKS(DOUBAO_PACKET_MS));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(DOUBAO_PACKET_MS));
+            }
+            continue;
+        }
+
+        uint32_t current_turn_index;
+        bool commit_requested;
+        bool commit_sent;
+        portENTER_CRITICAL(&s_mux);
+        current_turn_index = s.turn_index;
+        commit_requested = s.commit_requested;
+        commit_sent = s.commit_sent;
+        portEXIT_CRITICAL(&s_mux);
+
+        if (current_turn_index != local_turn_index) {
+            local_turn_index = current_turn_index;
+            next_audio_tick = 0;
+            first_tx_tick = 0;
+            last_tx_tick = 0;
+            tx_send_sum_ms = 0;
+            tx_send_count = 0;
+            tx_send_min_ms = UINT32_MAX;
+            tx_send_max_ms = 0;
+            tx_packets = 0;
+            tx_source_bytes = 0;
+            tx_wire_bytes = 0;
+            tx_interval_sum_ms = 0;
+            tx_interval_count = 0;
+            tx_interval_min_ms = UINT32_MAX;
+            tx_interval_max_ms = 0;
+            tx_abs_sum = 0;
+            tx_samples = 0;
+            tx_peak = 0;
+            tx_gain_clipped = 0;
+            tx_tail_silence_packets = 0;
+            ESP_LOGI(TAG, "half-duplex uplink switched to turn=%u",
+                     (unsigned)local_turn_index);
+        }
+
+        size_t queued = tx_len_snapshot();
+        bool server_finalized;
+        portENTER_CRITICAL(&s_mux);
+        server_finalized = s.asr_completed || s.response_started || s.audio_started;
+        portEXIT_CRITICAL(&s_mux);
+        if (commit_requested && !commit_sent && server_finalized && queued > 0) {
+            size_t discarded;
+            portENTER_CRITICAL(&s_mux);
+            discarded = s.tx_len;
+            s.tx_tail = s.tx_head;
+            s.tx_len = 0;
+            portEXIT_CRITICAL(&s_mux);
+            queued = 0;
+            ESP_LOGI(TAG,
+                     "server finalized turn; discarded %u queued tail bytes before response playback",
+                     (unsigned)discarded);
+        }
+        bool packet_ready = queued >= DOUBAO_PACKET_BYTES ||
+                            (commit_requested && queued > 0);
+        bool commit_ready = commit_requested && !commit_sent && queued == 0;
+        bool tail_silence_ready = commit_ready && !server_finalized &&
+                                  tx_tail_silence_packets <
+                                      DOUBAO_SERVER_VAD_TAIL_PACKETS;
+        if (commit_sent || (!packet_ready && !commit_ready && !tail_silence_ready)) {
+            if (s.events) {
+                xEventGroupWaitBits(s.events, BIT_UPLINK_KICK | BIT_WS_ERROR,
+                                    pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            continue;
+        }
+
+        size_t got = 0;
+        bool sent_tail_silence = false;
+        if (packet_ready || tail_silence_ready) {
+            TickType_t period_ticks = pdMS_TO_TICKS(DOUBAO_PACKET_MS);
+            if (period_ticks == 0) {
+                period_ticks = 1;
+            }
+            TickType_t now = xTaskGetTickCount();
+            if (next_audio_tick == 0) {
+                next_audio_tick = now;
+            }
+            if ((int32_t)(next_audio_tick - now) > 0) {
+                vTaskDelay(next_audio_tick - now);
+            }
+
+            if (packet_ready) {
+                got = tx_pop_packet(packet, commit_requested);
+                if (got == 0) {
+                    continue;
+                }
+                tx_gain_clipped += apply_uplink_gain(packet);
+            } else {
+                memset(packet, 0, sizeof(packet));
+                sent_tail_silence = true;
+            }
+
+            TickType_t tx_tick = xTaskGetTickCount();
+            TickType_t send_begin_tick = tx_tick;
+            status = send_audio_packet(packet);
+            TickType_t send_end_tick = xTaskGetTickCount();
+            uint32_t send_ms =
+                (uint32_t)((send_end_tick - send_begin_tick) * portTICK_PERIOD_MS);
+            if (status != ESP_OK) {
+                ESP_LOGE(TAG, "half-duplex uplink send failed: %s",
+                         esp_err_to_name(status));
+                break;
+            }
+
+            tx_send_sum_ms += send_ms;
+            tx_send_count++;
+            if (send_ms < tx_send_min_ms) tx_send_min_ms = send_ms;
+            if (send_ms > tx_send_max_ms) tx_send_max_ms = send_ms;
+
+            if (first_tx_tick == 0) first_tx_tick = tx_tick;
+            if (last_tx_tick != 0) {
+                uint32_t interval_ms =
+                    (uint32_t)((tx_tick - last_tx_tick) * portTICK_PERIOD_MS);
+                tx_interval_sum_ms += interval_ms;
+                tx_interval_count++;
+                if (interval_ms < tx_interval_min_ms) tx_interval_min_ms = interval_ms;
+                if (interval_ms > tx_interval_max_ms) tx_interval_max_ms = interval_ms;
+            }
+            last_tx_tick = tx_tick;
+            tx_packets++;
+            tx_source_bytes += (uint32_t)got;
+            tx_wire_bytes += DOUBAO_PACKET_BYTES;
+            if (sent_tail_silence) {
+                tx_tail_silence_packets++;
+            } else {
+                for (size_t i = 0; i < DOUBAO_PACKET_SAMPLES; ++i) {
+                    size_t off = i * sizeof(int16_t);
+                    int16_t sample = (int16_t)((uint16_t)packet[off] |
+                                               ((uint16_t)packet[off + 1U] << 8));
+                    int32_t mag = sample < 0 ? -(int32_t)sample : (int32_t)sample;
+                    tx_abs_sum += (uint32_t)mag;
+                    tx_samples++;
+                    if ((uint32_t)mag > tx_peak) tx_peak = (uint32_t)mag;
+                }
+            }
+
+            next_audio_tick += period_ticks;
+            TickType_t after_send_tick = xTaskGetTickCount();
+            if ((int32_t)(after_send_tick - next_audio_tick) > (int32_t)period_ticks) {
+                /* Do not burst after a network stall. Resume from the current
+                 * time and preserve the 20 ms packet cadence. */
+                next_audio_tick = after_send_tick;
+            }
+            if (sent_tail_silence) {
+                if (tx_tail_silence_packets == 1U) {
+                    ESP_LOGI(TAG,
+                             "microphone drained; sending bounded server-VAD silence tail=%ums",
+                             (unsigned)DOUBAO_SERVER_VAD_TAIL_MS);
+                }
+                continue;
+            }
+        }
+
+        portENTER_CRITICAL(&s_mux);
+        commit_requested = s.commit_requested;
+        commit_sent = s.commit_sent;
+        current_turn_index = s.turn_index;
+        portEXIT_CRITICAL(&s_mux);
+        if (current_turn_index == local_turn_index && commit_requested &&
+            !commit_sent && tx_len_snapshot() == 0) {
+            if (tx_packets == 0 && tx_source_bytes == 0) {
+                ESP_LOGE(TAG, "MIC-ASR turn rejected: no microphone PCM was sent");
+                status = ESP_ERR_INVALID_SIZE;
+                break;
+            }
+
+            uint32_t span_ms = 0;
+            if (first_tx_tick != 0 && last_tx_tick != 0) {
+                span_ms =
+                    (uint32_t)((last_tx_tick - first_tx_tick) * portTICK_PERIOD_MS);
+            }
+            uint32_t avg_interval_ms = tx_interval_count ?
+                (tx_interval_sum_ms / tx_interval_count) : 0U;
+            uint32_t min_interval_ms = tx_interval_count ? tx_interval_min_ms : 0U;
+            uint32_t mean_abs = tx_samples ? (uint32_t)(tx_abs_sum / tx_samples) : 0U;
+            uint32_t expected_span_ms =
+                tx_packets > 0 ? (tx_packets - 1U) * DOUBAO_PACKET_MS : 0U;
+            int32_t drift_ms = (int32_t)span_ms - (int32_t)expected_span_ms;
+            ESP_LOGI(TAG,
+                     "MIC-ASR uplink packet_ms=%u packets=%u source_bytes=%u wire_bytes=%u source_ms=%u wire_ms=%u server_vad_tail_packets=%u span_ms=%u expected_span_ms=%u drift_ms=%d interval_ms[min/avg/max]=%u/%u/%u send_call_ms[min/avg/max]=%u/%u/%u gain=%ux gain_clipped=%u mean_abs=%u peak=%u",
+                     (unsigned)DOUBAO_PACKET_MS, (unsigned)tx_packets,
+                     (unsigned)tx_source_bytes, (unsigned)tx_wire_bytes,
+                     (unsigned)(tx_source_bytes * 1000U /
+                                (DOUBAO_INPUT_RATE_HZ * sizeof(int16_t))),
+                     (unsigned)(tx_wire_bytes * 1000U /
+                                (DOUBAO_INPUT_RATE_HZ * sizeof(int16_t))),
+                     (unsigned)tx_tail_silence_packets,
+                     (unsigned)span_ms, (unsigned)expected_span_ms, (int)drift_ms,
+                     (unsigned)min_interval_ms, (unsigned)avg_interval_ms,
+                     (unsigned)tx_interval_max_ms,
+                     (unsigned)(tx_send_count ? tx_send_min_ms : 0U),
+                     (unsigned)(tx_send_count ? tx_send_sum_ms / tx_send_count : 0U),
+                     (unsigned)tx_send_max_ms, (unsigned)DOUBAO_UPLINK_GAIN_X,
+                     (unsigned)tx_gain_clipped, (unsigned)mean_abs,
+                     (unsigned)tx_peak);
+
+            portENTER_CRITICAL(&s_mux);
+            server_finalized = s.asr_completed || s.response_started || s.audio_started;
+            portEXIT_CRITICAL(&s_mux);
+            if (!server_finalized) {
+                status = send_simple_event("input_audio_buffer.commit");
+                if (status != ESP_OK) {
+                    ESP_LOGE(TAG, "input_audio_buffer.commit failed: %s",
+                             esp_err_to_name(status));
+                    break;
+                }
+                ESP_LOGW(TAG,
+                         "server VAD did not finalize after %ums zero tail; explicit commit fallback sent",
+                         (unsigned)DOUBAO_SERVER_VAD_TAIL_MS);
+            } else {
+                ESP_LOGI(TAG,
+                         "server finalized turn during zero tail; explicit commit skipped");
+            }
+
+            TickType_t committed_now = xTaskGetTickCount();
+            portENTER_CRITICAL(&s_mux);
+            if (s.turn_index == local_turn_index && s.commit_requested &&
+                !s.commit_sent && s.tx_len == 0) {
+                s.commit_sent = true;
+                s.commit_tick = committed_now;
+                s.response_progress_tick = committed_now;
+                s.response_progress_events = 0;
+            }
+            portEXIT_CRITICAL(&s_mux);
+            ESP_LOGI(TAG,
+                     "MIC-ASR uplink paused until follow-up turn server_finalized=%d",
+                     server_finalized ? 1 : 0);
+        }
+    }
+
+    bool expected_stop;
+    portENTER_CRITICAL(&s_mux);
+    expected_stop = s.abort_requested || s.close_requested || s.terminal_status != ESP_OK;
+    s.uplink_worker = NULL;
+    portEXIT_CRITICAL(&s_mux);
+    if (status != ESP_OK && !expected_stop) {
+        set_terminal_error(status);
+    }
+    ESP_LOGI(TAG, "half-duplex uplink task stopped status=%s stack_free=%uB",
+             esp_err_to_name(status),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    if (s.events) {
+        xEventGroupSetBits(s.events, BIT_UPLINK_STOPPED | BIT_WORK_KICK);
+    }
+    vTaskDelete(NULL);
+}
+
+static void duplex_worker(void *arg)
+{
+    (void)arg;
+    esp_err_t status = ESP_OK;
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t session_tick = 0;
+    uint32_t local_turn_index = 1;
     uint8_t rx24[960]; /* 20 ms of signed 24 kHz mono PCM */
     int16_t rx16[320];
 
@@ -1644,156 +1876,8 @@ static void duplex_worker(void *arg)
 
         if (current_turn_index != local_turn_index) {
             local_turn_index = current_turn_index;
-            next_audio_tick = 0;
-            tx_send_sum_ms = 0;
-            tx_send_count = 0;
-            tx_send_min_ms = UINT32_MAX;
-            tx_send_max_ms = 0;
-            first_tx_tick = 0;
-            last_tx_tick = 0;
-            tx_packets = 0;
-            tx_source_bytes = 0;
-            tx_wire_bytes = 0;
-            tx_interval_sum_ms = 0;
-            tx_interval_count = 0;
-            tx_interval_min_ms = UINT32_MAX;
-            tx_interval_max_ms = 0;
-            tx_abs_sum = 0;
-            tx_samples = 0;
-            tx_peak = 0;
-            tx_gain_clipped = 0;
             ESP_LOGI(TAG, "follow-up turn=%u ready on existing cloud session",
                      (unsigned)local_turn_index);
-        }
-
-        bool commit_sent_now = state_flag(&s.commit_sent);
-        bool commit_requested = state_flag(&s.commit_requested);
-
-        if (!commit_sent_now) {
-            size_t queued = tx_len_snapshot();
-            bool packet_ready = queued >= DOUBAO_PACKET_BYTES || (commit_requested && queued > 0);
-            if (packet_ready) {
-                if (next_audio_tick == 0) {
-                    next_audio_tick = xTaskGetTickCount();
-                }
-                TickType_t pace_now = xTaskGetTickCount();
-                if ((int32_t)(next_audio_tick - pace_now) > 0) {
-                    vTaskDelay(next_audio_tick - pace_now);
-                }
-
-                size_t got = tx_pop_packet(packet, commit_requested);
-                if (got > 0) {
-                    tx_gain_clipped += apply_uplink_gain(packet);
-                    TickType_t tx_tick = xTaskGetTickCount();
-                    TickType_t send_begin_tick = tx_tick;
-                    status = send_audio_packet(packet);
-                    TickType_t send_end_tick = xTaskGetTickCount();
-                    uint32_t send_ms = (uint32_t)((send_end_tick - send_begin_tick) * portTICK_PERIOD_MS);
-                    tx_send_sum_ms += send_ms;
-                    tx_send_count++;
-                    if (send_ms < tx_send_min_ms) tx_send_min_ms = send_ms;
-                    if (send_ms > tx_send_max_ms) tx_send_max_ms = send_ms;
-                    if (status != ESP_OK) break;
-
-                    if (s.diag_pcm && s.diag_pcm_len + DOUBAO_PACKET_BYTES <= DOUBAO_DIAG_PCM_BYTES) {
-                        memcpy(s.diag_pcm + s.diag_pcm_len, packet, DOUBAO_PACKET_BYTES);
-                        s.diag_pcm_len += DOUBAO_PACKET_BYTES;
-                    } else {
-                        s.diag_pcm_truncated = true;
-                    }
-
-                    if (first_tx_tick == 0) first_tx_tick = tx_tick;
-                    if (last_tx_tick != 0) {
-                        uint32_t interval_ms = (uint32_t)((tx_tick - last_tx_tick) * portTICK_PERIOD_MS);
-                        tx_interval_sum_ms += interval_ms;
-                        tx_interval_count++;
-                        if (interval_ms < tx_interval_min_ms) tx_interval_min_ms = interval_ms;
-                        if (interval_ms > tx_interval_max_ms) tx_interval_max_ms = interval_ms;
-                    }
-                    last_tx_tick = tx_tick;
-                    tx_packets++;
-                    tx_source_bytes += (uint32_t)got;
-                    tx_wire_bytes += DOUBAO_PACKET_BYTES;
-                    for (size_t i = 0; i < DOUBAO_PACKET_SAMPLES; ++i) {
-                        size_t off = i * 2U;
-                        int16_t sample = (int16_t)((uint16_t)packet[off] |
-                                                   ((uint16_t)packet[off + 1U] << 8));
-                        int32_t mag = sample < 0 ? -(int32_t)sample : (int32_t)sample;
-                        tx_abs_sum += (uint32_t)mag;
-                        tx_samples++;
-                        if ((uint32_t)mag > tx_peak) tx_peak = (uint32_t)mag;
-                    }
-
-                    /* Absolute-deadline pacing. Do not re-anchor the next
-                     * deadline to the actual (possibly late) send start; doing
-                     * so accumulates scheduler jitter into permanent drift.
-                     * If we fall more than one full packet behind, re-anchor
-                     * once to avoid a catch-up burst faster than realtime. */
-                    TickType_t period_ticks = pdMS_TO_TICKS(DOUBAO_PACKET_MS);
-                    if (period_ticks == 0) period_ticks = 1;
-                    next_audio_tick += period_ticks;
-                    TickType_t after_send_tick = xTaskGetTickCount();
-                    if ((int32_t)(after_send_tick - next_audio_tick) > (int32_t)period_ticks) {
-                        next_audio_tick = after_send_tick + period_ticks;
-                    }
-                    continue;
-                }
-            }
-
-            if (commit_requested && tx_len_snapshot() == 0) {
-                /* A microphone/ASR validation must never turn zero input into a
-                 * successful synthetic TTS response. Fail this turn explicitly
-                 * so a capture or handoff regression cannot become a false pass. */
-                if (tx_packets == 0 && tx_source_bytes == 0) {
-                    ESP_LOGE(TAG, "MIC-ASR commit rejected: no microphone PCM was sent");
-                    status = ESP_ERR_INVALID_SIZE;
-                    break;
-                }
-
-                uint32_t span_ms = 0;
-                if (first_tx_tick != 0 && last_tx_tick != 0) {
-                    span_ms = (uint32_t)((last_tx_tick - first_tx_tick) * portTICK_PERIOD_MS);
-                }
-                uint32_t avg_interval_ms = tx_interval_count ?
-                    (tx_interval_sum_ms / tx_interval_count) : 0U;
-                uint32_t min_interval_ms = tx_interval_count ? tx_interval_min_ms : 0U;
-                uint32_t mean_abs = tx_samples ? (uint32_t)(tx_abs_sum / tx_samples) : 0U;
-                uint32_t expected_span_ms = tx_packets > 0 ? (tx_packets - 1U) * DOUBAO_PACKET_MS : 0U;
-                int32_t drift_ms = (int32_t)span_ms - (int32_t)expected_span_ms;
-                ESP_LOGI(TAG,
-                         "MIC-ASR uplink packet_ms=%u packets=%u source_bytes=%u wire_bytes=%u source_ms=%u wire_ms=%u span_ms=%u expected_span_ms=%u drift_ms=%d interval_ms[min/avg/max]=%u/%u/%u send_call_ms[min/avg/max]=%u/%u/%u gain=%ux gain_clipped=%u mean_abs=%u peak=%u",
-                         (unsigned)DOUBAO_PACKET_MS, (unsigned)tx_packets, (unsigned)tx_source_bytes,
-                         (unsigned)tx_wire_bytes,
-                         (unsigned)(tx_source_bytes * 1000U / (DOUBAO_INPUT_RATE_HZ * 2U)),
-                         (unsigned)(tx_wire_bytes * 1000U / (DOUBAO_INPUT_RATE_HZ * 2U)),
-                         (unsigned)span_ms, (unsigned)expected_span_ms, (int)drift_ms,
-                         (unsigned)min_interval_ms, (unsigned)avg_interval_ms,
-                         (unsigned)tx_interval_max_ms,
-                         (unsigned)(tx_send_count ? tx_send_min_ms : 0U),
-                         (unsigned)(tx_send_count ? (tx_send_sum_ms / tx_send_count) : 0U),
-                         (unsigned)tx_send_max_ms,
-                         (unsigned)DOUBAO_UPLINK_GAIN_X, (unsigned)tx_gain_clipped,
-                         (unsigned)mean_abs, (unsigned)tx_peak);
-
-                /* Official Seeduplex end-of-turn flow. Local accepting_input
-                 * gates microphone writes while TTS is playing, so cloud-side
-                 * mute/unmute events are neither needed nor sent. */
-                status = send_simple_event("input_audio_buffer.commit");
-                if (status != ESP_OK) break;
-                ESP_LOGI(TAG, "input_audio_buffer.commit sent (official end-of-turn)");
-                TickType_t commit_now = xTaskGetTickCount();
-                portENTER_CRITICAL(&s_mux);
-                s.commit_sent = true;
-                s.commit_tick = commit_now;
-                s.response_progress_tick = commit_now;
-                s.response_progress_events = 0;
-                portEXIT_CRITICAL(&s_mux);
-                ESP_LOGI(TAG, "MIC-ASR input finalized; waiting for server ASR and response");
-
-                /* Saving happens after paced streaming and commit, so SD latency
-                 * cannot distort the 20 ms uplink schedule. */
-                save_uplink_diag_wav();
-            }
         }
 
         bool commit_sent = state_flag(&s.commit_sent);
@@ -2087,7 +2171,7 @@ esp_err_t voice_duplex_volc_init(const voice_duplex_volc_config_t *config)
     s.done = config->done;
     s.done_ctx = config->user_ctx;
     portEXIT_CRITICAL(&s_mux);
-    ESP_LOGI(TAG, "initialized endpoint=%s build=%s mode=official-commit-multiturn",
+    ESP_LOGI(TAG, "initialized endpoint=%s build=%s mode=half-duplex-multiturn",
              DOUBAO_ENDPOINT, DOUBAO_BUILD_TAG);
     return ESP_OK;
 }
@@ -2159,8 +2243,6 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
     s.downlink_resampled_clipped_samples = 0;
     s.downlink_play_frames = 0;
     s.terminal_status = ESP_OK;
-    s.diag_pcm_len = 0;
-    s.diag_pcm_truncated = false;
     s.commit_tick = 0;
     s.audio_done_tick = 0;
     s.response_progress_tick = 0;
@@ -2178,32 +2260,32 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
 
     xEventGroupClearBits(s.events, BIT_WS_CONNECTED | BIT_SESSION_READY |
                                    BIT_WS_ERROR | BIT_WORK_KICK |
-                                   BIT_SESSION_CLOSED);
+                                   BIT_SESSION_CLOSED | BIT_UPLINK_STOPPED |
+                                   BIT_UPLINK_KICK);
 
     esp_err_t err = load_api_key();
     if (err != ESP_OK) goto fail;
 
-    ESP_LOGI(TAG, "begin memory internal_free=%u largest=%u psram_free=%u ws_buf=%u ws_stack=%u worker_stack=%u",
+    ESP_LOGI(TAG, "begin memory internal_free=%u largest=%u psram_free=%u ws_buf=%u ws_stack=%u worker_stack=%u uplink_stack=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
              (unsigned)DOUBAO_WS_BUFFER_BYTES, (unsigned)DOUBAO_WS_TASK_STACK,
-             (unsigned)DOUBAO_WORKER_STACK);
+             (unsigned)DOUBAO_WORKER_STACK, (unsigned)DOUBAO_UPLINK_STACK);
 
     s.tx_ring = heap_caps_malloc(DOUBAO_TX_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.rx_ring = heap_caps_malloc(DOUBAO_RX_RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.decode_buf = heap_caps_malloc(DOUBAO_AUDIO_DECODE_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.tx_b64 = heap_caps_malloc(DOUBAO_TX_B64_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.tx_json = heap_caps_malloc(DOUBAO_TX_JSON_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s.diag_pcm = heap_caps_malloc(DOUBAO_DIAG_PCM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.tool_event = heap_caps_malloc(DOUBAO_TOOL_EVENT_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.tool_output = heap_caps_malloc(DOUBAO_TOOL_OUTPUT_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s.tool_reply = heap_caps_malloc(DOUBAO_TOOL_REPLY_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s.tx_ring || !s.rx_ring || !s.decode_buf || !s.tx_b64 || !s.tx_json ||
-        !s.diag_pcm || !s.tool_event || !s.tool_output || !s.tool_reply) {
+        !s.tool_event || !s.tool_output || !s.tool_reply) {
         ESP_LOGE(TAG,
-                 "begin allocation failed stage=session_buffers tx=%p rx=%p dec=%p b64=%p json=%p diag=%p tool_evt=%p tool_out=%p tool_reply=%p events=%p",
-                 s.tx_ring, s.rx_ring, s.decode_buf, s.tx_b64, s.tx_json, s.diag_pcm,
+                 "begin allocation failed stage=session_buffers tx=%p rx=%p dec=%p b64=%p json=%p tool_evt=%p tool_out=%p tool_reply=%p events=%p",
+                 s.tx_ring, s.rx_ring, s.decode_buf, s.tx_b64, s.tx_json,
                  s.tool_event, s.tool_output, s.tool_reply, s.events);
         err = ESP_ERR_NO_MEM;
         goto fail;
@@ -2238,8 +2320,25 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
         goto fail;
     }
     err = esp_websocket_register_events(s.ws, WEBSOCKET_EVENT_ANY,
-                                                websocket_event_handler, NULL);
+                                                 websocket_event_handler, NULL);
     if (err != ESP_OK) goto fail;
+
+    TaskHandle_t uplink_task = xTaskCreateStaticPinnedToCore(
+        duplex_uplink_worker, "doubao_uplink", DOUBAO_UPLINK_STACK, NULL,
+        DOUBAO_UPLINK_PRIORITY, s_uplink_task_stack, &s_uplink_task_tcb,
+        tskNO_AFFINITY);
+    if (!uplink_task) {
+        ESP_LOGE(TAG,
+                 "begin failed stage=uplink_task internal_free=%u largest=%u stack=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)DOUBAO_UPLINK_STACK);
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
+    portENTER_CRITICAL(&s_mux);
+    s.uplink_worker = uplink_task;
+    portEXIT_CRITICAL(&s_mux);
 
     TaskHandle_t task = NULL;
     BaseType_t created = xTaskCreatePinnedToCore(duplex_worker, "doubao_voice",
@@ -2258,11 +2357,11 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
     s.worker = task;
     portEXIT_CRITICAL(&s_mux);
 
-    ESP_LOGI(TAG, "before websocket start internal_free=%u largest=%u ws_stack=%u worker_stack=%u ws_buf=%u",
+    ESP_LOGI(TAG, "before websocket start internal_free=%u largest=%u ws_stack=%u worker_stack=%u uplink_stack=%u ws_buf=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)DOUBAO_WS_TASK_STACK, (unsigned)DOUBAO_WORKER_STACK,
-             (unsigned)DOUBAO_WS_BUFFER_BYTES);
+             (unsigned)DOUBAO_UPLINK_STACK, (unsigned)DOUBAO_WS_BUFFER_BYTES);
     err = esp_websocket_client_start(s.ws);
     if (err != ESP_OK) {
         set_terminal_error(err);
@@ -2272,6 +2371,13 @@ esp_err_t voice_duplex_volc_begin(uint32_t input_sample_rate_hz)
 
 fail:
     ESP_LOGE(TAG, "begin failed: %s", esp_err_to_name(err));
+    portENTER_CRITICAL(&s_mux);
+    s.close_requested = true;
+    portEXIT_CRITICAL(&s_mux);
+    if (s.events) {
+        xEventGroupSetBits(s.events, BIT_WORK_KICK | BIT_UPLINK_KICK);
+    }
+    wait_for_uplink_stop();
     if (s.ws) {
         (void)esp_websocket_client_destroy(s.ws);
         s.ws = NULL;
@@ -2281,7 +2387,6 @@ fail:
     free(s.decode_buf); s.decode_buf = NULL;
     free(s.tx_b64); s.tx_b64 = NULL;
     free(s.tx_json); s.tx_json = NULL;
-    free(s.diag_pcm); s.diag_pcm = NULL;
     free(s.tool_event); s.tool_event = NULL;
     free(s.tool_output); s.tool_output = NULL;
     free(s.tool_reply); s.tool_reply = NULL;
@@ -2289,6 +2394,7 @@ fail:
     s.active = false;
     s.accepting_input = false;
     s.worker = NULL;
+    s.uplink_worker = NULL;
     portEXIT_CRITICAL(&s_mux);
     notify_done_once(err);
     return err;
@@ -2360,8 +2466,8 @@ esp_err_t voice_duplex_volc_push_pcm(const int16_t *samples, size_t sample_count
      */
     if (bytes > DOUBAO_TX_RING_BYTES - s.tx_len) {
         size_t need = bytes - (DOUBAO_TX_RING_BYTES - s.tx_len);
-        need -= need % DOUBAO_PACKET_BYTES;
-        if (need == 0) need = DOUBAO_PACKET_BYTES;
+        need = ((need + DOUBAO_PACKET_BYTES - 1U) / DOUBAO_PACKET_BYTES) *
+               DOUBAO_PACKET_BYTES;
         dropped = ring_drop_locked(s.tx_ring, DOUBAO_TX_RING_BYTES,
                                    &s.tx_tail, &s.tx_len, need);
     }
@@ -2377,7 +2483,7 @@ esp_err_t voice_duplex_volc_push_pcm(const int16_t *samples, size_t sample_count
                  (unsigned)tx_len_snapshot());
         return ESP_ERR_NO_MEM;
     }
-    if (events) xEventGroupSetBits(events, BIT_WORK_KICK);
+    if (events) xEventGroupSetBits(events, BIT_UPLINK_KICK);
     return ESP_OK;
 }
 
@@ -2421,7 +2527,7 @@ esp_err_t voice_duplex_volc_commit(void)
              (int)dc_mean, (unsigned)zero_permille, (unsigned)clipped,
              (unsigned)queued);
 
-    if (events) xEventGroupSetBits(events, BIT_WORK_KICK);
+    if (events) xEventGroupSetBits(events, BIT_UPLINK_KICK);
     ESP_LOGI(TAG, "microphone commit requested build=%s queued=%u", DOUBAO_BUILD_TAG,
              (unsigned)queued);
     return ESP_OK;
@@ -2480,8 +2586,6 @@ esp_err_t voice_duplex_volc_resume_turn(void)
     s.capture_zero_samples = 0;
     s.capture_clipped_samples = 0;
     s.capture_push_calls = 0;
-    s.diag_pcm_len = 0;
-    s.diag_pcm_truncated = false;
     s.commit_tick = 0;
     s.audio_done_tick = 0;
     s.response_progress_tick = 0;
@@ -2494,7 +2598,7 @@ esp_err_t voice_duplex_volc_resume_turn(void)
     portEXIT_CRITICAL(&s_mux);
 
     if (events) {
-        xEventGroupSetBits(events, BIT_WORK_KICK);
+        xEventGroupSetBits(events, BIT_WORK_KICK | BIT_UPLINK_KICK);
     }
     ESP_LOGI(TAG, "follow-up turn=%u accepted without reconnect",
              (unsigned)turn_index);
@@ -2515,7 +2619,7 @@ esp_err_t voice_duplex_volc_close(void)
     portEXIT_CRITICAL(&s_mux);
 
     if (events) {
-        xEventGroupSetBits(events, BIT_WORK_KICK);
+        xEventGroupSetBits(events, BIT_WORK_KICK | BIT_UPLINK_KICK);
     }
     return ESP_OK;
 }
@@ -2531,7 +2635,9 @@ void voice_duplex_volc_abort(void)
     }
     events = s.events;
     portEXIT_CRITICAL(&s_mux);
-    if (active && events) xEventGroupSetBits(events, BIT_WORK_KICK);
+    if (active && events) {
+        xEventGroupSetBits(events, BIT_WORK_KICK | BIT_UPLINK_KICK);
+    }
 }
 
 bool voice_duplex_volc_is_busy(void)

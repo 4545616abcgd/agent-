@@ -78,7 +78,9 @@ typedef struct {
 esp_err_t voice_service_start(void);
 
 /**
- * Capture one follow-up turn without loading WakeNet. A short listen cue is
+
+
+* Capture one follow-up turn without loading WakeNet. A short listen cue is
  * played before capture starts, and the realtime sink must already have
  * resumed an existing cloud session.
  */

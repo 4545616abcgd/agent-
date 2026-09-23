@@ -10,6 +10,8 @@ sdkconfig.priv
 sdkconfig.bmgr_board.old
 dependencies.lock
 managed_components/
+application/**/build*/
+!application/volc_rtc_agent/dependencies.lock
 
 # IDE / Editor
 .vscode/
@@ -22,9 +24,12 @@ managed_components/
 
 # Environment
 .env
+**/.env.local
 # Cache / Compiled
 .cache
 *.pyc
+services/**/node_modules/
+services/**/*.log
 
 # MCP / Memov
 .mcp.json

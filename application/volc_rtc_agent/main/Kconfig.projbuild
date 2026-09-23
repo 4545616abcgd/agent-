@@ -1,0 +1,99 @@
+menu "ESP-Claw RTC Agent"
+
+    config RTC_AGENT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            When empty, reuse wifi_ssid from the existing ESP-Claw "app"
+            NVS namespace.
+
+    config RTC_AGENT_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Used with RTC_AGENT_WIFI_SSID. When the SSID is empty, load the
+            matching retained wifi_password from NVS instead.
+
+    config VOLC_RTC_MODE
+        bool
+        default y
+
+    config RTC_AGENT_VOLC_INSTANCE_ID
+        string "Volc hardware-agent InstanceID"
+        default ""
+        help
+            InstanceID from the hardware conversational-agent product page.
+
+    config RTC_AGENT_VOLC_PRODUCT_KEY
+        string "Volc hardware-agent ProductKey"
+        default ""
+
+    config RTC_AGENT_VOLC_PRODUCT_SECRET
+        string "Volc hardware-agent ProductSecret"
+        default ""
+        help
+            Keep this value only in the local, git-ignored sdkconfig file.
+
+    config RTC_AGENT_VOLC_DEVICE_NAME
+        string "Hardware-agent device name"
+        default "espclaw-dcb4d905d268"
+
+    config RTC_AGENT_VOLC_BOT_ID
+        string "Associated conversational-agent Bot ID"
+        default ""
+
+    config RTC_AGENT_AUTO_START
+        bool "Start an RTC session immediately after Wi-Fi connects"
+        default n
+        help
+            Intended only for bring-up. The product default waits for the
+            local wake phrase before starting a cloud conversation.
+
+    config RTC_AGENT_SESSION_MAX_SECONDS
+        int "Maximum continuous RTC session duration"
+        range 60 3600
+        default 1800
+
+    config RTC_AGENT_I2S_BCLK_GPIO
+        int "I2S BCLK GPIO"
+        range 0 48
+        default 4
+
+    config RTC_AGENT_I2S_WS_GPIO
+        int "I2S WS/LRCLK GPIO"
+        range 0 48
+        default 5
+
+    config RTC_AGENT_I2S_MIC_GPIO
+        int "INMP441 data GPIO"
+        range 0 48
+        default 6
+
+    config RTC_AGENT_I2S_SPK_GPIO
+        int "MAX98357A data GPIO"
+        range 0 48
+        default 17
+
+    config RTC_AGENT_MIC_RIGHT_SLOT
+        bool "INMP441 L/R pin selects the right slot"
+        default n
+
+    config RTC_AGENT_MIC_GAIN
+        int "Microphone digital gain"
+        range 1 32
+        default 16
+
+    config RTC_AGENT_SPEAKER_GAIN_PERCENT
+        int "Speaker digital gain percent"
+        range 1 100
+        default 80
+
+    config RTC_AGENT_AEC_REFERENCE_DELAY_MS
+        int "AEC playback-reference delay in milliseconds"
+        range 0 200
+        default 40
+        help
+            Compensates amplifier, acoustic, and I2S DMA latency. Tune in
+            10 ms steps from captured AEC diagnostics after hardware tests.
+
+endmenu

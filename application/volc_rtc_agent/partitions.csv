@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,   Size
+# Preserve the edge_agent NVS location. 0x10000-0x11fff stays reserved.
+nvs,      data, nvs,     0xA000,   0x6000
+phy_init, data, phy,     0x12000,  0x1000
+factory,  app,  factory, 0x20000,  6M
+model,    data, spiffs,  0x620000, 2M
