@@ -307,27 +307,18 @@ void volc_destroy(volc_engine_t handle) {
     if (NULL == engine) {
         return;
     }
-    // if (engine->status == VOLC_RT_STATE_STARTED) {
-    //     volc_stop(handle);
-    // }
-    switch(engine->mode) {
-        case VOLC_MODE_WS:
 #if defined(ENABLE_WS_MODE)
-            volc_ws_destroy(engine->ws);
-#else
-            LOGW("WS mode is not enabled");
-#endif
-            break;
-        case VOLC_MODE_RTC:
-#if defined(ENABLE_RTC_MODE)
-            volc_rtc_destroy(engine->rtc);
-#else
-            LOGW("RTC mode is not enabled");
-#endif
-            break;
-        default:
-            break;
+    if (engine->ws) {
+        volc_ws_destroy(engine->ws);
+        engine->ws = NULL;
     }
+#endif
+#if defined(ENABLE_RTC_MODE)
+    if (engine->rtc) {
+        volc_rtc_destroy(engine->rtc);
+        engine->rtc = NULL;
+    }
+#endif
     _iot_info_free(&engine->info);
     HAL_SAFE_FREE(engine);
 }

@@ -33,6 +33,10 @@
 
 </div>
 
+> 本仓库目前的语音联调入口是 [火山 RTC 验证工程](./application/volc_rtc_agent/README_CN.md)。
+> 原 ESP-Claw 应用及天气/Web 能力仍在 [edge_agent](./application/edge_agent/)；
+> 旧版实验包已整理到本地 [归档目录](./archive/README.md)，不参与当前构建。
+
 **ESP-Claw** 是乐鑫推出的面向物联网设备的 **Chat Coding「聊天造物」** 式 AI Agent 框架，以对话定义设备行为，在乐鑫芯片上本地完成感知、决策与执行的完整闭环。ESP-Claw 自 OpenClaw 理念出发，用 C 语言重新实现，轻盈、智能、成长。仅需一块几美元的 ESP32 系列芯片，便可体验 ESP-Claw 的轻灵特性。
 
 <div align="center">

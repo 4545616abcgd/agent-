@@ -138,9 +138,21 @@ static void process_packet(rtc_message_packet_t *packet)
         return;
     }
 
-    packet->data[packet->size] = '\0';
+    const uint8_t *bytes = packet->data;
+    size_t payload_size = ((size_t)bytes[4] << 24) |
+                          ((size_t)bytes[5] << 16) |
+                          ((size_t)bytes[6] << 8) |
+                          (size_t)bytes[7];
+    if (payload_size == 0 || payload_size > packet->size - 8U) {
+        ESP_LOGW(TAG,
+                 "malformed RTC message prefix %.4s declared=%u received=%u",
+                 (const char *)packet->data, (unsigned)payload_size,
+                 (unsigned)packet->size);
+        return;
+    }
+
     cJSON *root = cJSON_ParseWithLength(
-        (const char *)packet->data + 8, packet->size - 8U);
+        (const char *)packet->data + 8, payload_size);
     if (!root) {
         ESP_LOGW(TAG, "RTC message JSON parse failed");
         return;

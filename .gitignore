@@ -43,6 +43,7 @@ Thumbs.db
 .codex
 
 # Local ESP-Claw development artifacts
+/archive/legacy_local/
 .esp_claw_backups/
 .patch_backups/
 _patch_backups/

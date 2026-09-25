@@ -19,6 +19,10 @@
 `StartVoiceChat` 调用。唤醒后由官方 SDK 自动完成设备注册、RTC 配置和智能体
 入房；会话内持续上传音频，句尾和下一轮由云端 VAD 处理。
 
+本地设备加入 RTC 房间不代表云端智能体已经可用。固件只有收到官方
+`LISTENING` 状态后才播放“我在”并提示用户说话；若云端 30 秒内未就绪，失败
+会话会自动结束并恢复唤醒重试，避免设备长时间卡在不可对话状态。
+
 ## 固定环境
 
 - 芯片：ESP32-S3-WROOM-1-N16R8
@@ -75,9 +79,9 @@ cd D:\esp-claw\application\volc_rtc_agent
   "$env:IDF_PATH\tools\idf.py" -B build-idf554-s3 build
 ```
 
-2026-09-23 已完成无凭据编译验证：
+2026-09-25 已完成本地增量编译验证：
 
-- `volc_rtc_agent.bin`：1,879,184 字节
+- `volc_rtc_agent.bin`：1,889,936 字节（`0x1cd690`）
 - factory app 分区：6 MiB
 - 剩余：约 70%
 

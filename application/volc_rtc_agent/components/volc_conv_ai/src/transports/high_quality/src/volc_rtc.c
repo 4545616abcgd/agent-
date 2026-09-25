@@ -16,6 +16,8 @@
 #define MAGIC_CONV    "conv"
 #define MAGIC_LENGTH 4
 #define MAGIC_OFFSET 8
+#define RTC_FINI_POLL_MS 10
+#define RTC_FINI_TIMEOUT_MS 5000
 const char* interrupt_str = "{\"Command\":\"interrupt\"}";
 
 typedef struct {
@@ -98,18 +100,32 @@ static int __rtc_start(rtc_impl_t* rtc, volc_rtc_option_t* option)
     room_opt.auto_subscribe_audio = rtc->b_audio_subscribe;
     room_opt.auto_subscribe_video = rtc->b_video_subscribe;
     LOGI("Joining RTC channel: vpub=%d, vsub=%d, apub=%d, asub=%d", (int)room_opt.auto_publish_video, (int)room_opt.auto_subscribe_video, (int)room_opt.auto_publish_audio, (int)room_opt.auto_subscribe_audio);
-    int ret = byte_rtc_join_room(rtc->rtc, option->p_channel_name, option->p_uid, option->p_token, &room_opt);
+    rtc->p_channel_name = channel_name;
+    rtc->p_user_id = user_id;
+    rtc->b_pipeline_started = true;
+    rtc->b_channel_joined = false;
+    rtc->b_user_joined = false;
+    int ret = byte_rtc_join_room(rtc->rtc, rtc->p_channel_name, rtc->p_user_id, option->p_token, &room_opt);
     if (ret != 0) {
-        HAL_SAFE_FREE(channel_name);
-        HAL_SAFE_FREE(user_id);
+        rtc->b_pipeline_started = false;
+        HAL_SAFE_FREE(rtc->p_channel_name);
+        HAL_SAFE_FREE(rtc->p_user_id);
         LOGE("Failed to join room: %d", ret);
         return ret;
     }
-    rtc->b_pipeline_started = true;
-    rtc->p_channel_name = channel_name;
-    rtc->p_user_id = user_id;
 
     return 0;
+}
+
+static void __rtc_clear_room_info(rtc_impl_t* rtc)
+{
+    if (!rtc) {
+        return;
+    }
+    HAL_SAFE_FREE(rtc->info.rtc_opt.p_channel_name);
+    HAL_SAFE_FREE(rtc->info.rtc_opt.p_uid);
+    HAL_SAFE_FREE(rtc->info.rtc_opt.p_token);
+    HAL_SAFE_FREE(rtc->info.task_id);
 }
 
 static void __rtc_stop(rtc_impl_t* rtc)
@@ -118,26 +134,58 @@ static void __rtc_stop(rtc_impl_t* rtc)
         LOGE("rtc instance is NULL");
         return;
     }
-    if (rtc->b_pipeline_started && rtc->p_channel_name) {
+    bool was_started = rtc->b_pipeline_started;
+    rtc->b_pipeline_started = false;
+    rtc->b_channel_joined = false;
+    rtc->b_user_joined = false;
+    if (was_started && rtc->p_channel_name) {
         int ret = byte_rtc_leave_room(rtc->rtc, rtc->p_channel_name);
         if (ret != 0) {
             LOGE("Failed to leave room: %d", ret);
         }
     }
 
-    rtc->b_pipeline_started = false;
-    rtc->b_channel_joined = false;
-    rtc->b_user_joined = false;
     rtc->b_first_keyframe_received = false;
     HAL_SAFE_FREE(rtc->p_channel_name);
     HAL_SAFE_FREE(rtc->p_user_id);
     HAL_SAFE_FREE(rtc->p_remote_user_id);
-    HAL_SAFE_FREE(rtc->info.rtc_opt.p_channel_name);
-    HAL_SAFE_FREE(rtc->info.rtc_opt.p_uid);
-    HAL_SAFE_FREE(rtc->info.rtc_opt.p_token);
-    HAL_SAFE_FREE(rtc->info.task_id);
+    __rtc_clear_room_info(rtc);
 
     return;
+}
+
+static bool __rtc_release_engine(rtc_impl_t* rtc)
+{
+    if (!rtc || !rtc->rtc) {
+        return true;
+    }
+
+    /* Stop forwarding callbacks before the owning volc engine is freed. */
+    rtc->message_callback = NULL;
+    rtc->data_callback = NULL;
+    rtc->context = NULL;
+    rtc->b_fini = false;
+
+    int ret = byte_rtc_fini(rtc->rtc);
+    if (ret != 0) {
+        LOGE("byte_rtc_fini failed: %d; preserving RTC context", ret);
+        return false;
+    }
+
+    int waited_ms = 0;
+    while (!rtc->b_fini && waited_ms < RTC_FINI_TIMEOUT_MS) {
+        usleep(1000 * RTC_FINI_POLL_MS);
+        waited_ms += RTC_FINI_POLL_MS;
+    }
+    if (!rtc->b_fini) {
+        LOGE("RTC fini callback timed out after %d ms; preserving RTC context",
+             RTC_FINI_TIMEOUT_MS);
+        return false;
+    }
+
+    byte_rtc_destroy(rtc->rtc);
+    rtc->rtc = NULL;
+    return true;
 }
 
 static void __send_data_2_user(rtc_impl_t* rtc, const void* data, int data_len, volc_data_info_t* info) {
@@ -158,22 +206,41 @@ static void _send_message_2_user(rtc_impl_t* rtc, volc_msg_t* msg)
     }
 }
 
-static bool _is_target_message(const uint8_t* message, const char* target) {
-    if (message == NULL || target == NULL) {
+static bool _read_binary_message_payload(const uint8_t* message, int size,
+                                         const char* target,
+                                         const uint8_t** payload,
+                                         size_t* payload_size) {
+    if (message == NULL || target == NULL || payload == NULL ||
+        payload_size == NULL || size < MAGIC_OFFSET) {
         return false;
     }
-    // Check if the first 4 bytes match the magic number for "subv"
-    if (*(const uint32_t*)message != *(const uint32_t*)target) {
+    if (memcmp(message, target, MAGIC_LENGTH) != 0) {
         return false;
     }
+
+    size_t declared_size = ((size_t)message[MAGIC_LENGTH] << 24) |
+                           ((size_t)message[MAGIC_LENGTH + 1] << 16) |
+                           ((size_t)message[MAGIC_LENGTH + 2] << 8) |
+                           (size_t)message[MAGIC_LENGTH + 3];
+    if (declared_size == 0 ||
+        declared_size > (size_t)(size - MAGIC_OFFSET)) {
+        LOGW("invalid %.4s message length: declared=%u received=%d",
+             target, (unsigned)declared_size, size);
+        return false;
+    }
+
+    *payload = message + MAGIC_OFFSET;
+    *payload_size = declared_size;
     return true;
 }
 
-static int _on_conversion_status_message_parsed(uint8_t* message, rtc_impl_t* rtc) {
+static int _on_conversion_status_message_parsed(const uint8_t* message,
+                                                size_t message_size,
+                                                rtc_impl_t* rtc) {
     int c = -1;
     char* error_reason = NULL;
     volc_msg_t msg = { 0 };
-    cJSON *root = cJSON_Parse((const char*)message);
+    cJSON *root = cJSON_ParseWithLength((const char*)message, message_size);
     if (root == NULL) {
         return c;
     }
@@ -199,6 +266,10 @@ static void _on_join_channel_success(byte_rtc_engine_t engine, const char* chann
     volc_msg_t msg = {0};
     LOGI("join channel success %s elapsed %d ms\n", channel, elapsed_ms);
     rtc_impl_t* rtc = (rtc_impl_t*) byte_rtc_get_user_data(engine);
+    if (!rtc || !rtc->b_pipeline_started) {
+        LOGD("ignoring late join-success callback after local room leave");
+        return;
+    }
 
     rtc->b_first_keyframe_received = false;
     rtc->b_channel_joined = true;
@@ -212,6 +283,10 @@ static void _on_user_joined(byte_rtc_engine_t engine, const char* channel, const
     rtc_impl_t* rtc = (rtc_impl_t*) byte_rtc_get_user_data(engine);
     volc_msg_t msg = {0};
     LOGI("remote user joined %s:%s elapsed %d ms\n", channel, user_name, elapsed_ms);
+    if (!rtc || !rtc->b_pipeline_started) {
+        LOGD("ignoring late user-joined callback after local room leave");
+        return;
+    }
 
     HAL_SAFE_FREE(rtc->p_remote_user_id);
     rtc->p_remote_user_id = strdup(user_name);
@@ -306,6 +381,10 @@ static void _on_global_error(byte_rtc_engine_t engine, int code, const char* mes
 {
     volc_msg_t msg_data = {0};
     rtc_impl_t* rtc = (rtc_impl_t*) byte_rtc_get_user_data(engine);
+    if (!rtc || !rtc->b_pipeline_started) {
+        LOGD("ignoring late global-error callback after local room leave");
+        return;
+    }
     rtc->b_channel_joined = false;
 
     rtc->b_first_keyframe_received = false;
@@ -359,9 +438,16 @@ static void _on_message_received(byte_rtc_engine_t engine, const char* channel_n
         LOGE("pipeline not started or channel not joined or user not joined");
         return;
     }
+    if (message == NULL || size <= 0) {
+        LOGW("ignoring empty RTC message");
+        return;
+    }
 
-    if (_is_target_message(message, MAGIC_CONV)) {
-        ret = _on_conversion_status_message_parsed((uint8_t *)message + MAGIC_OFFSET,rtc);
+    const uint8_t* payload = NULL;
+    size_t payload_size = 0;
+    if (_read_binary_message_payload(message, size, MAGIC_CONV,
+                                     &payload, &payload_size)) {
+        ret = _on_conversion_status_message_parsed(payload, payload_size, rtc);
         if(ret != -1){
             msg.code = VOLC_MSG_CONV_STATUS;
             msg.data.conv_status = ret;
@@ -520,6 +606,7 @@ static int __rtc_init(rtc_impl_t* engine, cJSON* p_config)
 
 volc_rtc_t volc_rtc_create(const char* appid, void* context, cJSON* p_config, volc_msg_cb message_callback, volc_data_cb data_callback)
 {
+    bool rtc_released = true;
     rtc_impl_t* rtc = (rtc_impl_t*) volc_osal_calloc(1, sizeof(rtc_impl_t));
     if (!rtc) {
         LOGE("volc_rtc_create: malloc rtc failed");
@@ -542,7 +629,12 @@ volc_rtc_t volc_rtc_create(const char* appid, void* context, cJSON* p_config, vo
     LOGD("rtc create success");
     return (volc_rtc_t)rtc;
 err_out_label:
+    rtc_released = __rtc_release_engine(rtc);
     HAL_SAFE_FREE(rtc->p_appid);
+    if (!rtc_released) {
+        LOGE("volc_rtc_create cleanup incomplete; RTC context retained to avoid use-after-free");
+        return NULL;
+    }
     HAL_SAFE_FREE(rtc);
     return NULL;
 }
@@ -555,12 +647,11 @@ void volc_rtc_destroy(volc_rtc_t handle)
         return;
     }
     __rtc_stop(rtc);
-
-    byte_rtc_fini(rtc->rtc);
-    while (!rtc->b_fini) {
-        usleep(1000 * 10);
+    if (!__rtc_release_engine(rtc)) {
+        LOGE("rtc destroy incomplete; context retained to avoid use-after-free");
+        return;
     }
-    byte_rtc_destroy(rtc->rtc);
+    HAL_SAFE_FREE(rtc->p_appid);
     HAL_SAFE_FREE(rtc->p_channel_name);
     HAL_SAFE_FREE(rtc->p_user_id);
     HAL_SAFE_FREE(rtc->p_remote_user_id);
@@ -578,12 +669,21 @@ int volc_rtc_start(volc_rtc_t rtc, const char* bot_id, volc_iot_info_t* iot_info
         return -1;
     }
     char* task_id = "test";
-    if (volc_get_rtc_config(iot_info, __volc_to_rtc_audio_codec(rtc_impl->audio_codec), bot_id, task_id, &rtc_impl->info, params)) {
-        LOGE("get rtc config failed");
-        return -1;
+    __rtc_clear_room_info(rtc_impl);
+    ret = volc_get_rtc_config(iot_info,
+                              __volc_to_rtc_audio_codec(rtc_impl->audio_codec),
+                              bot_id, task_id, &rtc_impl->info, params);
+    if (ret != 0) {
+        LOGE("get rtc config failed: %d", ret);
+        __rtc_clear_room_info(rtc_impl);
+        return ret;
     }
     opt = &rtc_impl->info.rtc_opt;
-    return __rtc_start(rtc_impl, opt);
+    ret = __rtc_start(rtc_impl, opt);
+    if (ret != 0) {
+        __rtc_clear_room_info(rtc_impl);
+    }
+    return ret;
 }
 
 int volc_rtc_stop(volc_rtc_t handle) {

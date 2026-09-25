@@ -69,6 +69,8 @@ static const char *TAG = "rtc_agent";
             "\"{\\\"debug\\\":{\\\"log_to_console\\\":1}}\"," \
             "\"{\\\"rtc\\\":{\\\"access\\\":{\\\"concurrent_requests\\\":1}}}\"," \
             "\"{\\\"rtc\\\":{\\\"ice\\\":{\\\"concurrent_agents\\\":1}}}\"," \
+            "\"{\\\"rtc\\\":{\\\"network\\\":{\\\"enable_audio_jitter2\\\":0}}}\"," \
+            "\"{\\\"rtc\\\":{\\\"report\\\":{\\\"enable\\\":0}}}\"," \
             "\"{\\\"audio\\\":{\\\"codec\\\":{\\\"pcma\\\":{\\\"s_samples_per_frame\\\":480}}}}\"" \
         "]}}"
 
@@ -98,11 +100,11 @@ typedef struct {
     volatile bool room_connected;
     volatile bool remote_agent_joined;
     volatile bool cloud_ready;
+    volatile bool listening_confirmed;
     volatile bool uplink_enabled;
     bool credentials_ready;
     bool pending_start;
     bool wake_ack_played;
-    bool cloud_ready_warning_logged;
     int64_t session_start_ms;
     int64_t room_join_ms;
     int64_t last_cloud_attempt_ms;
@@ -203,6 +205,7 @@ static void on_volc_event(volc_engine_t handle,
         s_agent.room_connected = false;
         s_agent.remote_agent_joined = false;
         s_agent.cloud_ready = false;
+        s_agent.listening_confirmed = false;
         s_agent.uplink_enabled = false;
         xEventGroupSetBits(s_agent.events, AGENT_BIT_DISCONNECTED);
         break;
@@ -225,6 +228,7 @@ static void on_volc_event(volc_engine_t handle,
     case VOLC_EV_QUOTA_EXCEEDED:
         s_agent.remote_agent_joined = false;
         s_agent.cloud_ready = false;
+        s_agent.listening_confirmed = false;
         s_agent.uplink_enabled = false;
         xEventGroupSetBits(s_agent.events, AGENT_BIT_QUOTA);
         break;
@@ -244,10 +248,11 @@ static void on_conversation_status(volc_engine_t handle,
     switch (status) {
     case VOLC_CONV_STATUS_LISTENING:
         name = "listening";
+        s_agent.listening_confirmed = true;
         if (!s_agent.cloud_ready) {
             s_agent.cloud_ready = true;
-            xEventGroupSetBits(s_agent.events, AGENT_BIT_CLOUD_READY);
         }
+        xEventGroupSetBits(s_agent.events, AGENT_BIT_CLOUD_READY);
         break;
     case VOLC_CONV_STATUS_THINKING:
         name = "thinking";
@@ -575,6 +580,7 @@ static void stop_session(void)
     s_agent.room_connected = false;
     s_agent.remote_agent_joined = false;
     s_agent.cloud_ready = false;
+    s_agent.listening_confirmed = false;
     s_agent.starting = false;
     s_agent.pending_start = false;
     rtc_audio_flush_playback();
@@ -588,7 +594,6 @@ static void stop_session(void)
     s_agent.session_start_ms = 0;
     s_agent.room_join_ms = 0;
     s_agent.wake_ack_played = false;
-    s_agent.cloud_ready_warning_logged = false;
 }
 
 static void start_session(void)
@@ -601,8 +606,8 @@ static void start_session(void)
     s_agent.room_connected = false;
     s_agent.remote_agent_joined = false;
     s_agent.cloud_ready = false;
+    s_agent.listening_confirmed = false;
     s_agent.uplink_enabled = false;
-    s_agent.cloud_ready_warning_logged = false;
     s_agent.uplink_packets = 0;
     s_agent.downlink_packets = 0;
     s_agent.downlink_drops = 0;
@@ -614,7 +619,8 @@ static void start_session(void)
     };
     int result = volc_start(s_agent.engine, &options);
     if (result != 0) {
-        ESP_LOGE(TAG, "hardware-agent session start failed code=%d", result);
+        ESP_LOGE(TAG, "hardware-agent session start failed code=%d (%s)",
+                 result, volc_err_2_str(result));
         s_agent.starting = false;
         s_agent.pending_start = false;
         s_agent.session_start_ms = 0;
@@ -677,10 +683,9 @@ static void agent_task(void *arg)
                 ESP_LOGI(TAG,
                          "device joined RTC room; audio uplink active while waiting for cloud agent");
                 s_agent.starting = false;
-                if (!s_agent.wake_ack_played) {
-                    s_agent.wake_ack_played = true;
-                    ESP_LOGI(TAG, "official SDK CONNECTED; playing 'wo zai'");
-                    play_wake_ack();
+                if (s_agent.cloud_ready) {
+                    xEventGroupSetBits(s_agent.events,
+                                       AGENT_BIT_CLOUD_READY);
                 }
             } else {
                 ESP_LOGI(TAG, "duplicate local RTC connected event ignored");
@@ -694,13 +699,31 @@ static void agent_task(void *arg)
         if ((bits & AGENT_BIT_CLOUD_READY) && s_agent.session_started &&
             s_agent.room_connected) {
             s_agent.starting = false;
-            ESP_LOGI(TAG,
-                     "cloud agent ready (LISTENING/downlink); continuous conversation active");
-        } else if (bits & AGENT_BIT_CLOUD_READY) {
+            if (s_agent.listening_confirmed && !s_agent.wake_ack_played) {
+                s_agent.wake_ack_played = true;
+                s_agent.uplink_enabled = false;
+                ESP_LOGI(TAG,
+                         "official SDK LISTENING confirmed; playing 'wo zai'");
+                play_wake_ack();
+                if (s_agent.session_started && s_agent.room_connected &&
+                    s_agent.cloud_ready) {
+                    s_agent.uplink_enabled = true;
+                    ESP_LOGI(TAG,
+                             "wake acknowledgement complete; speak now");
+                }
+            }
+            ESP_LOGI(TAG, "cloud agent ready; continuous conversation active");
+        } else if ((bits & AGENT_BIT_CLOUD_READY) &&
+                   !s_agent.session_started) {
+            s_agent.cloud_ready = false;
+            s_agent.listening_confirmed = false;
             ESP_LOGW(TAG, "ignoring stale cloud-ready event after session ended");
+        } else if (bits & AGENT_BIT_CLOUD_READY) {
+            ESP_LOGI(TAG,
+                     "cloud-ready state arrived before local RTC join; deferring acknowledgement");
         }
 
-        if ((bits & AGENT_BIT_REMOTE_LEFT) && s_agent.cloud_ready) {
+        if ((bits & AGENT_BIT_REMOTE_LEFT) && s_agent.session_started) {
             ESP_LOGW(TAG, "cloud agent left RTC room; ending conversation");
             stop_session();
         }
@@ -730,12 +753,17 @@ static void agent_task(void *arg)
             stop_session();
         }
         if (s_agent.session_started && s_agent.room_connected &&
-            !s_agent.cloud_ready && s_agent.room_join_ms > 0 &&
-            !s_agent.cloud_ready_warning_logged &&
+            !s_agent.listening_confirmed && s_agent.room_join_ms > 0 &&
             now_ms - s_agent.room_join_ms > REMOTE_AGENT_JOIN_TIMEOUT_MS) {
-            s_agent.cloud_ready_warning_logged = true;
-            ESP_LOGW(TAG,
-                     "cloud agent has not reached LISTENING after 30s; keeping the official SDK session open for authorization propagation and diagnostics");
+            if (!s_agent.remote_agent_joined) {
+                ESP_LOGE(TAG,
+                         "cloud Bot did not join the RTC room after 30s (uplink_packets=%u); verify product/Bot association, License, and RTC authorization",
+                         (unsigned)s_agent.uplink_packets);
+            } else {
+                ESP_LOGE(TAG,
+                         "cloud Bot joined but did not reach LISTENING after 30s; verify the Bot runtime and conversation-state signaling");
+            }
+            stop_session();
         }
         if (s_agent.session_started && s_agent.session_start_ms > 0 &&
             now_ms - s_agent.session_start_ms >
