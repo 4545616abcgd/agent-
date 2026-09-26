@@ -45,3 +45,9 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
 # Official hardware-agent high-quality transport.
 CONFIG_VOLC_RTC_MODE=y
+
+# Conservative first-pass levels for full-duplex AEC. Tune on hardware after
+# confirming that the microphone no longer clips on speaker playback.
+CONFIG_RTC_AGENT_MIC_GAIN=4
+CONFIG_RTC_AGENT_SPEAKER_GAIN_PERCENT=60
+CONFIG_RTC_AGENT_AEC_REFERENCE_DELAY_MS=40

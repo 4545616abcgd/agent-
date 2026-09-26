@@ -693,7 +693,23 @@ static void agent_task(void *arg)
         }
 
         if (bits & AGENT_BIT_REMOTE_JOINED) {
-            ESP_LOGI(TAG, "remote RTC user joined; waiting for official LISTENING state");
+            ESP_LOGI(TAG, "remote RTC user joined; cloud agent is available");
+            /* Some RTC sessions deliver audio/subtitles without the optional
+             * conversation-state callback. Do not hold the wake acknowledgement
+             * or the conversation behind that callback. */
+            s_agent.cloud_ready = true;
+            s_agent.starting = false;
+            if (!s_agent.wake_ack_played && s_agent.session_started &&
+                s_agent.room_connected) {
+                s_agent.wake_ack_played = true;
+                s_agent.uplink_enabled = false;
+                ESP_LOGI(TAG, "remote agent joined; playing 'wo zai'");
+                play_wake_ack();
+                if (s_agent.session_started && s_agent.room_connected) {
+                    s_agent.uplink_enabled = true;
+                    ESP_LOGI(TAG, "wake acknowledgement complete; speak now");
+                }
+            }
         }
 
         if ((bits & AGENT_BIT_CLOUD_READY) && s_agent.session_started &&
@@ -753,16 +769,12 @@ static void agent_task(void *arg)
             stop_session();
         }
         if (s_agent.session_started && s_agent.room_connected &&
-            !s_agent.listening_confirmed && s_agent.room_join_ms > 0 &&
+            !s_agent.remote_agent_joined && !s_agent.cloud_ready &&
+            s_agent.room_join_ms > 0 &&
             now_ms - s_agent.room_join_ms > REMOTE_AGENT_JOIN_TIMEOUT_MS) {
-            if (!s_agent.remote_agent_joined) {
-                ESP_LOGE(TAG,
-                         "cloud Bot did not join the RTC room after 30s (uplink_packets=%u); verify product/Bot association, License, and RTC authorization",
-                         (unsigned)s_agent.uplink_packets);
-            } else {
-                ESP_LOGE(TAG,
-                         "cloud Bot joined but did not reach LISTENING after 30s; verify the Bot runtime and conversation-state signaling");
-            }
+            ESP_LOGE(TAG,
+                     "cloud Bot did not join or send audio after 30s (uplink_packets=%u); verify product/Bot association and cloud task status",
+                     (unsigned)s_agent.uplink_packets);
             stop_session();
         }
         if (s_agent.session_started && s_agent.session_start_ms > 0 &&
