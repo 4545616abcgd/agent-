@@ -13,6 +13,9 @@ dependencies:
   cap_weather_station:
     path: ../../../components/claw_capabilities/cap_weather_station
 
+  cap_volc_rtc:
+    path: ../../../components/claw_capabilities/cap_volc_rtc
+
   captive_dns:
     path: ../../../components/common/captive_dns
 
@@ -55,6 +58,9 @@ dependencies:
 
   voice_dialog:
     path: ../components/voice_dialog
+
+  volc_rtc_voice:
+    path: ../components/volc_rtc_voice
 
   weather_service:
     path: ../../../components/common/weather_service

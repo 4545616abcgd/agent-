@@ -460,7 +460,14 @@ static void _on_message_received(byte_rtc_engine_t engine, const char* channel_n
 
 static void _on_message_send_result(byte_rtc_engine_t engine, const char* channel_name, int64_t msgid, int error, const char* extencontent)
 {
-    LOGD("----------------------->MessageSendResult msg id %" PRId64 ", error %d, extencontent %s \n", msgid, error, extencontent ? extencontent : "");
+    (void)engine;
+    (void)channel_name;
+    (void)extencontent;
+    if (error != 0) {
+        LOGE("RTC message receipt msg_id=%" PRId64 " error=%d", msgid, error);
+    } else {
+        LOGI("RTC message receipt msg_id=%" PRId64 " error=0 (transport only)", msgid);
+    }
 };
 
 static void _on_license_will_expire(byte_rtc_engine_t engine, int daysleft)
@@ -732,6 +739,8 @@ int volc_rtc_send(volc_rtc_t handle, const void* data, int size, volc_data_info_
                 data, size, data_info->info.message.is_binary,
                 RTS_MESSAGE_RELIABLE);
             ret = message_id < 0 ? (int)message_id : 0;
+            LOGI("RTC message submitted msg_id=%" PRId64 " bytes=%d prefix=%.4s",
+                 message_id, size, size >= 4 ? (const char *)data : "?");
             break;
         }
         default:

@@ -1,5 +1,13 @@
 menu "App Config"
 
+    config APP_VOLC_RTC_VOICE
+        bool "Use the official Volc RTC voice path"
+        depends on IDF_TARGET_ESP32S3
+        default n
+        help
+            Use the validated RTC wake/AEC/I2S path instead of the legacy
+            Voice Service. Requires ADF_PATH during the build.
+
 menu "Default Wi-Fi Settings"
 
     config APP_WIFI_SSID

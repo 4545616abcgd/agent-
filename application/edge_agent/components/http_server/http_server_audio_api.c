@@ -32,6 +32,7 @@
 #include "voice_service.h"
 #include "voice_dialog.h"
 #include "voice_tts.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "http_audio";
 
@@ -659,6 +660,13 @@ static esp_err_t do_asr_config(httpd_req_t *req)
 
 static esp_err_t audio_api_handler(httpd_req_t *req)
 {
+#if CONFIG_APP_VOLC_RTC_VOICE
+    esp_err_t status_err = httpd_resp_set_status(req, "409 Conflict");
+    if (status_err != ESP_OK) {
+        return status_err;
+    }
+    return httpd_resp_sendstr(req, "RTC voice owns the audio device");
+#endif
     if (strcmp(req->uri, "/api/audio/info") == 0) {
         return send_info(req);
     }

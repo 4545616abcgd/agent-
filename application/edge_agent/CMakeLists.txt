@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 
+if(DEFINED ENV{ADF_PATH})
+    list(APPEND EXTRA_COMPONENT_DIRS
+        "$ENV{ADF_PATH}/components/audio_sal"
+        "$ENV{ADF_PATH}/components/audio_pipeline"
+        "$ENV{ADF_PATH}/components/audio_recorder"
+        "$ENV{ADF_PATH}/components/esp-adf-libs"
+        "$ENV{ADF_PATH}/components/esp-adf-libs/esp_audio_codec"
+        "$ENV{ADF_PATH}/components/esp-sr"
+        "${CMAKE_SOURCE_DIR}/../volc_rtc_agent/components/volc_conv_ai")
+endif()
+
 include("${CMAKE_SOURCE_DIR}/tools/cmake/esp_idf_patch.cmake")
 include("${CMAKE_SOURCE_DIR}/tools/cmake/flash_partition_defaults.cmake")
 

@@ -13,6 +13,7 @@
 #include "esp_check.h"
 #include "esp_g711_dec.h"
 #include "esp_g711_enc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -36,6 +37,7 @@ static const char *TAG = "rtc_agent";
 #define AGENT_BIT_TOKEN_EXPIRED BIT6
 #define AGENT_BIT_LICENSE_WARNING BIT7
 #define AGENT_BIT_CLOUD_READY   BIT8
+#define AGENT_BIT_STOP          BIT9
 
 #define AFE_FRAME_MS            20U
 #define AFE_FRAME_SAMPLES       (RTC_AUDIO_SAMPLE_RATE_HZ * AFE_FRAME_MS / 1000U)
@@ -96,6 +98,7 @@ typedef struct {
     void *g711_decoder;
     volc_engine_t engine;
     volatile bool starting;
+    volatile bool ready;
     volatile bool session_started;
     volatile bool room_connected;
     volatile bool remote_agent_joined;
@@ -329,10 +332,58 @@ static void on_message_data(volc_engine_t handle,
                         info_ptr ? info_ptr->is_binary : false);
 }
 
+esp_err_t rtc_agent_send_tool_message(const void *data, size_t size)
+{
+    if (!data || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_agent.engine || !s_agent.session_started ||
+        !s_agent.room_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    volc_message_info_t info = {.is_binary = true};
+    return volc_send_message(s_agent.engine, data, size, &info) == 0
+               ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t rtc_agent_get_status(rtc_agent_status_t *status)
+{
+    ESP_RETURN_ON_FALSE(status, ESP_ERR_INVALID_ARG, TAG, "status is NULL");
+    *status = (rtc_agent_status_t) {
+        .ready = s_agent.ready,
+        .configured = s_agent.credentials_ready,
+        .engine_ready = s_agent.engine != NULL,
+        .session_started = s_agent.session_started,
+        .room_connected = s_agent.room_connected,
+        .remote_agent_joined = s_agent.remote_agent_joined,
+    };
+    return ESP_OK;
+}
+
+esp_err_t rtc_agent_request_start(void)
+{
+    ESP_RETURN_ON_FALSE(s_agent.ready && s_agent.events,
+                        ESP_ERR_INVALID_STATE, TAG, "RTC service is not ready");
+    ESP_RETURN_ON_FALSE(s_agent.credentials_ready,
+                        ESP_ERR_INVALID_STATE, TAG, "RTC credentials are incomplete");
+    xEventGroupSetBits(s_agent.events, AGENT_BIT_WAKE);
+    return ESP_OK;
+}
+
+esp_err_t rtc_agent_request_stop(void)
+{
+    ESP_RETURN_ON_FALSE(s_agent.ready && s_agent.events,
+                        ESP_ERR_INVALID_STATE, TAG, "RTC service is not ready");
+    xEventGroupClearBits(s_agent.events, AGENT_BIT_WAKE);
+    xEventGroupSetBits(s_agent.events, AGENT_BIT_STOP);
+    return ESP_OK;
+}
+
 static esp_err_t init_afe(void)
 {
     recorder_sr_cfg_t config = DEFAULT_RECORDER_SR_CFG(
         "MR", "model", AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    config.feed_task_stack = 6 * 1024;
     ESP_RETURN_ON_FALSE(config.afe_cfg, ESP_ERR_NO_MEM, TAG,
                         "AFE config allocation failed");
     config.multinet_init = false;
@@ -357,6 +408,9 @@ static esp_err_t init_afe(void)
     ESP_RETURN_ON_ERROR(
         s_agent.sr_iface->set_afe_monitor(s_agent.sr, afe_monitor, NULL),
         TAG, "AFE monitor setup failed");
+    ESP_LOGI(TAG, "Before AFE tasks: internal_free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     ESP_RETURN_ON_ERROR(s_agent.sr_iface->base.enable(s_agent.sr, true),
                         TAG, "AFE tasks failed to start");
     ESP_LOGI(TAG, "AFE ready: WakeNet + NS + full-duplex AEC");
@@ -617,6 +671,10 @@ static void start_session(void)
         .bot_id = CONFIG_RTC_AGENT_VOLC_BOT_ID,
         .params = NULL,
     };
+    ESP_LOGI(TAG, "RTC start memory internal_free=%u largest=%u psram_free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     int result = volc_start(s_agent.engine, &options);
     if (result != 0) {
         ESP_LOGE(TAG, "hardware-agent session start failed code=%d (%s)",
@@ -629,12 +687,17 @@ static void start_session(void)
     }
     s_agent.session_started = true;
     s_agent.session_start_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI(TAG, "RTC requested memory internal_free=%u largest=%u psram_free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "hardware-agent session requested; waiting for RTC connection");
 }
 
 static void agent_task(void *arg)
 {
     (void)arg;
+    bool afe_stack_logged = false;
 #if CONFIG_RTC_AGENT_AUTO_START
     if (CONFIG_RTC_AGENT_AUTO_START) {
         s_agent.pending_start = true;
@@ -643,6 +706,16 @@ static void agent_task(void *arg)
 
     for (;;) {
         int64_t now_ms = esp_timer_get_time() / 1000;
+        if (!afe_stack_logged && now_ms >= 30000) {
+            TaskHandle_t feed = xTaskGetHandle("feed_task");
+            TaskHandle_t fetch = xTaskGetHandle("fetch_task");
+            if (feed && fetch) {
+                ESP_LOGI(TAG, "AFE task stack low-water feed=%u fetch=%u",
+                         (unsigned)uxTaskGetStackHighWaterMark(feed),
+                         (unsigned)uxTaskGetStackHighWaterMark(fetch));
+                afe_stack_logged = true;
+            }
+        }
         if (!s_agent.engine && s_agent.credentials_ready &&
             system_time_ready() &&
             (s_agent.last_cloud_attempt_ms == 0 ||
@@ -659,8 +732,13 @@ static void agent_task(void *arg)
                 AGENT_BIT_DISCONNECTED | AGENT_BIT_QUOTA |
                 AGENT_BIT_REMOTE_JOINED | AGENT_BIT_REMOTE_LEFT |
                 AGENT_BIT_TOKEN_EXPIRED | AGENT_BIT_LICENSE_WARNING |
-                AGENT_BIT_CLOUD_READY,
+                AGENT_BIT_CLOUD_READY | AGENT_BIT_STOP,
             pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+
+        if (bits & AGENT_BIT_STOP) {
+            stop_session();
+            continue;
+        }
 
         if (bits & AGENT_BIT_WAKE) {
             s_agent.pending_start = true;
@@ -765,7 +843,11 @@ static void agent_task(void *arg)
         if (s_agent.session_started && !s_agent.room_connected &&
             s_agent.session_start_ms > 0 &&
             now_ms - s_agent.session_start_ms > RTC_ROOM_CONNECT_TIMEOUT_MS) {
-            ESP_LOGE(TAG, "device RTC room connection timed out");
+            ESP_LOGE(TAG,
+                     "device RTC room connection timed out internal_free=%u largest=%u psram_free=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             stop_session();
         }
         if (s_agent.session_started && s_agent.room_connected &&
@@ -842,6 +924,8 @@ esp_err_t rtc_agent_start(void)
         NULL, 7, s_agent_task_stack, &s_agent.agent_task_ctrl, 1);
     ESP_RETURN_ON_FALSE(uplink && downlink && agent,
                         ESP_ERR_NO_MEM, TAG, "agent task creation failed");
+
+    s_agent.ready = true;
 
     ESP_LOGI(TAG,
              "ConversationalAI Embedded Kit 2.0 path ready codec=G711A cloud_config=%s",

@@ -21,10 +21,14 @@ void rtc_message_process(const void *message,
  * merged back into the full product. The standalone bring-up app keeps the
  * protocol parser active but returns ESP_ERR_NOT_SUPPORTED for capabilities.
  */
-esp_err_t rtc_message_dispatch_tool(const char *name,
+esp_err_t rtc_message_dispatch_tool(const char *call_id,
+                                    const char *name,
                                     const char *arguments_json,
                                     char *output_json,
                                     size_t output_capacity);
+
+/* Local read-only checks, never sent to the cloud as tool results. */
+void rtc_message_probe_tools(char *output, size_t capacity);
 
 #ifdef __cplusplus
 }

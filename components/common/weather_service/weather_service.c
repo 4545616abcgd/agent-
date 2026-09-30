@@ -18,6 +18,8 @@ static const char *TAG = "weather_service";
 #define WEATHER_EVT_REFRESH BIT0
 #define WEATHER_EVT_STOP    BIT1
 #define WEATHER_EVT_DONE    BIT2
+#define WEATHER_MIN_VALID_EPOCH 1704067200
+#define WEATHER_TIME_RETRY_MS 1000U
 
 typedef struct {
     SemaphoreHandle_t mutex;
@@ -29,6 +31,11 @@ typedef struct {
 } weather_service_ctx_t;
 
 static weather_service_ctx_t s_weather;
+
+static bool weather_time_ready(void)
+{
+    return time(NULL) >= WEATHER_MIN_VALID_EPOCH;
+}
 
 static void status_set_error(esp_err_t err)
 {
@@ -103,10 +110,15 @@ static esp_err_t refresh_once(void)
     xSemaphoreTake(s_weather.mutex, portMAX_DELAY);
     provider = s_weather.provider;
     network_online = s_weather.status.network_online;
-    s_weather.status.last_attempt_at = time(NULL);
+    s_weather.status.last_attempt_at = weather_time_ready() ? time(NULL) : 0;
     xSemaphoreGive(s_weather.mutex);
 
     if (!network_online) {
+        status_set_error(ESP_ERR_INVALID_STATE);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* A pre-SNTP fetch otherwise becomes decades "old" after the clock jumps. */
+    if (!weather_time_ready()) {
         status_set_error(ESP_ERR_INVALID_STATE);
         return ESP_ERR_INVALID_STATE;
     }
@@ -154,6 +166,12 @@ static void weather_task(void *arg)
             wait_ms = s_weather.status.refresh_interval_ms;
         }
         xSemaphoreGive(s_weather.mutex);
+
+        /* Retry clock readiness, not HTTP, so first weather is not delayed by
+         * the normal 30-minute interval after an early network-up event. */
+        if (!weather_time_ready()) {
+            wait_ms = WEATHER_TIME_RETRY_MS;
+        }
 
         EventBits_t bits = xEventGroupWaitBits(
             s_weather.events,

@@ -1,0 +1,58 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "weather_get_current",
+      "description": "Read actual current outdoor weather cached by this weather station's configured QWeather API. Use for current weather at the device location, never guess from model knowledge. Check ok, stale and cache_age_sec. This tool cannot query another city or indoor sensors.",
+      "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "weather_get_hourly",
+      "description": "Read the device's cached hourly outdoor forecast at its configured location. Use for rain timing and the next few hours. Default 6, maximum 24 hours. Explain unavailable or stale results.",
+      "parameters": {"type": "object", "properties": {"hours": {"type": "integer", "minimum": 1, "maximum": 24}}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "weather_get_daily",
+      "description": "Read the device's cached daily outdoor forecast at its configured location, including today's or tomorrow's high/low temperatures. Default 7, maximum 7 days. Do not invent missing forecasts.",
+      "parameters": {"type": "object", "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 7}}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "weather_get_alerts",
+      "description": "Read cached official outdoor weather alerts at the device's configured location. Use for weather warnings. Missing data is not proof of no warning. Include details only when requested.",
+      "parameters": {"type": "object", "properties": {"include_details": {"type": "boolean"}}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "weather_get_status",
+      "description": "Read the real device weather provider, configuration, connectivity, cache age and last fetch error. Use when weather data is unavailable or the user asks about the weather API.",
+      "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_system_info",
+      "description": "Read this ESP-Claw device's real chip, uptime, firmware, memory, CPU, Wi-Fi or IP state. Use for device status questions. Select only the requested sections. Does not expose sensor readings, credentials or restart controls.",
+      "parameters": {"type": "object", "properties": {"sections": {"type": "array", "items": {"type": "string", "enum": ["chip", "uptime", "version", "memory", "cpu", "wifi", "ip"]}, "minItems": 1, "uniqueItems": true}}, "additionalProperties": false}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_current_time",
+      "description": "Read this device's current local time. Use when asked for the current time. Do not infer the time from model knowledge.",
+      "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+    }
+  }
+]

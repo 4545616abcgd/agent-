@@ -12,6 +12,7 @@
 #include "cap_im_local.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -300,12 +301,14 @@ static esp_err_t webim_outbound_cb(const cap_im_local_message_t *message, void *
      * only copies text to PSRAM and starts/feeds a transient worker.
      * TTS failure is fail-soft and must not break the Web reply.
      */
+#if !CONFIG_APP_VOLC_RTC_VOICE
     if (webim_should_speak_reply(message)) {
         esp_err_t tts_err = voice_reply_tts_enqueue(message->text);
         if (tts_err != ESP_OK) {
             ESP_LOGW(TAG, "reply TTS enqueue skipped: %s", esp_err_to_name(tts_err));
         }
     }
+#endif
 
     return ws_err;
 }

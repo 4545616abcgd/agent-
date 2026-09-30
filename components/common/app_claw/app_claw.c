@@ -111,7 +111,20 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
 
 #define APP_SYSTEM_PROMPT \
     APP_SYSTEM_PROMPT_COMMON \
+    APP_PRODUCT_PROMPT \
     APP_SYSTEM_PROMPT_SUFFIX
+
+#if CONFIG_APP_VOLC_RTC_VOICE
+#define APP_PRODUCT_PROMPT \
+    "You are the assistant in a smart desktop weather station powered by ESP-Claw. " \
+    "When asked who you are, introduce yourself as a weather-station and everyday-life assistant, " \
+    "not as a generic chatbot or the Volcengine platform. " \
+    "Use the registered weather and device-status tools for live facts. " \
+    "Never invent sensor readings, forecasts, alerts, or device capabilities; explain when data is unavailable or stale. " \
+    "Answer in concise, natural Chinese unless the user asks for another language.\n"
+#else
+#define APP_PRODUCT_PROMPT ""
+#endif
 
 static bool app_claw_bool_is_true(const char *value)
 {
@@ -458,6 +471,27 @@ static void app_time_sync_success(bool had_valid_time, void *ctx)
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_SYSTEM
+static void app_start_time_sync(bool scheduler_ready)
+{
+    esp_err_t err = cap_system_time_sync_service_start(
+        &(cap_system_time_sync_service_config_t) {
+            .network_ready = NULL,
+#if CONFIG_APP_CLAW_CAP_SCHEDULER
+            .on_sync_success = scheduler_ready ? app_time_sync_success : NULL,
+#else
+            .on_sync_success = NULL,
+#endif
+        });
+#if !CONFIG_APP_CLAW_CAP_SCHEDULER
+    (void)scheduler_ready;
+#endif
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "time sync start skipped: %s", esp_err_to_name(err));
+    }
+}
+#endif
+
 // Resolve the storage paths threaded through the capability framework from the
 // logical homes registered in claw_paths. This is where app_claw owns the data
 // layout (the subdirectory convention); main only decides the mount points.
@@ -629,6 +663,14 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
+#if CONFIG_APP_CLAW_CAP_SYSTEM
+#if CONFIG_APP_CLAW_CAP_SCHEDULER
+        app_start_time_sync(scheduler_ready);
+#else
+        app_start_time_sync(false);
+#endif
+#endif
+
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
         ESP_LOGI(TAG, "Before event router: internal_free=%u largest=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -649,6 +691,13 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 #endif
     }
 #else
+#if CONFIG_APP_CLAW_CAP_SYSTEM
+#if CONFIG_APP_CLAW_CAP_SCHEDULER
+    app_start_time_sync(scheduler_ready);
+#else
+    app_start_time_sync(false);
+#endif
+#endif
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER
     ESP_RETURN_ON_ERROR(claw_event_router_start(), TAG, "Failed to start event router");
 #endif
@@ -661,26 +710,7 @@ esp_err_t app_claw_start(const app_claw_config_t *config)
 #endif
 #endif
 
-#if CONFIG_APP_CLAW_CAP_SYSTEM
-    /*
-     * SNTP startup can fail on a tight heap. That is not fatal: the system cap
-     * keeps retrying later, and aborting here would reboot the whole device.
-     */
-    esp_err_t time_sync_err = cap_system_time_sync_service_start(
-        &(cap_system_time_sync_service_config_t) {
-                        .network_ready = NULL,
-#if CONFIG_APP_CLAW_CAP_SCHEDULER
-                        .on_sync_success = scheduler_ready ? app_time_sync_success : NULL,
-#else
-                        .on_sync_success = NULL,
-#endif
-                    });
-    if (time_sync_err != ESP_OK) {
-        ESP_LOGW(TAG, "time sync start skipped: %s", esp_err_to_name(time_sync_err));
-    }
-#endif
-
-#if CONFIG_APP_CLAW_ENABLE_CLI
+#if CONFIG_APP_CLAW_ENABLE_CLI && !CONFIG_APP_VOLC_RTC_VOICE
     ESP_RETURN_ON_ERROR(app_claw_cli_start(), TAG, "Failed to start CLI");
 #endif
 #if CONFIG_APP_CLAW_CAP_EVENT_ROUTER

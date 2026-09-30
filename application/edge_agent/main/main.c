@@ -27,6 +27,10 @@
 #include "cmd_voice.h"
 #include "voice_service.h"
 #include "voice_dialog.h"
+#if CONFIG_APP_VOLC_RTC_VOICE
+#include "cap_volc_rtc.h"
+#include "rtc_agent.h"
+#endif
 #include "cmd_weather.h"
 #include "cmd_ota.h"
 #include "ota_service.h"
@@ -384,6 +388,30 @@ static esp_err_t register_weather_agent_capability(void)
     return err;
 }
 
+#if CONFIG_APP_VOLC_RTC_VOICE
+static esp_err_t main_register_rtc_cap_group(const app_claw_config_t *config,
+                                             const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_volc_rtc_register_group();
+}
+
+static esp_err_t register_rtc_agent_capability(void)
+{
+    static const app_capability_external_group_t group = {
+        .group_id = "cap_volc_rtc",
+        .display_name = "Real-time Voice",
+        .llm_visible_by_default = false,
+        .prepare = NULL,
+        .reg = main_register_rtc_cap_group,
+    };
+
+    esp_err_t err = app_capabilities_register_external_group(&group);
+    return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+}
+#endif
+
 void app_main(void)
 {
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
@@ -512,6 +540,9 @@ void app_main(void)
          * capability selection.
          */
         ESP_ERROR_CHECK(register_weather_agent_capability());
+#if CONFIG_APP_VOLC_RTC_VOICE
+        ESP_ERROR_CHECK(register_rtc_agent_capability());
+#endif
 
         esp_err_t claw_start_err = app_claw_start(s_claw_config);
         claw_runtime_started = (claw_start_err == ESP_OK);
@@ -543,10 +574,12 @@ void app_main(void)
          * The product Voice Service itself autostarts near the end of app_main().
          * A missing/miswired microphone, model, or amplifier must never block boot.
          */
+#if !CONFIG_APP_VOLC_RTC_VOICE
         esp_err_t voice_cmd_err = register_voice_command(app_fs_storage_base_path());
         if (voice_cmd_err != ESP_OK) {
             ESP_LOGW(TAG, "Voice command registration failed: %s", esp_err_to_name(voice_cmd_err));
         }
+#endif
 
         /*
          * Diagnostic only. The product weather service runs automatically; these
@@ -581,6 +614,25 @@ void app_main(void)
 
     app_free_runtime_state();
 
+#if CONFIG_APP_VOLC_RTC_VOICE
+    /* The SNTP worker must release its internal stack before AFE creates
+     * the feed/fetch tasks. RTC also cannot start with an invalid clock. */
+    bool waiting_for_rtc_time = false;
+    while (time(NULL) < 1704067200) {
+        if (!waiting_for_rtc_time) {
+            ESP_LOGI(TAG, "Waiting for network time before starting RTC audio");
+            waiting_for_rtc_time = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (waiting_for_rtc_time) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    esp_err_t rtc_err = rtc_agent_start();
+    if (rtc_err != ESP_OK) {
+        ESP_LOGE(TAG, "Volc RTC voice start failed: %s", esp_err_to_name(rtc_err));
+    }
+#else
     esp_err_t voice_dialog_err = voice_dialog_init();
     if (voice_dialog_err != ESP_OK) {
         ESP_LOGW(TAG, "Voice dialog init failed: %s", esp_err_to_name(voice_dialog_err));
@@ -600,4 +652,5 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Voice Service autostart failed: %s", esp_err_to_name(voice_autostart_err));
     }
+#endif
 }
